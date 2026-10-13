@@ -89,13 +89,21 @@
             "args": [
                 "-fdiagnostics-color=always",
                 "-g",
-                "${file}",
+                "${workspaceFolder}\\src\\main.c",
                 "-o",
-                "${fileDirname}\\${fileBasenameNoExtension}.exe"
+                "${workspaceFolder}\\src\\main.exe",
+                "-IC:/raylib/raylib/src",
+                "-LC:/raylib/raylib/src",
+                "-lraylib",
+                "-lopengl32",
+                "-lgdi32",
+                "-lwinmm"
             ],
             "options": {
-                "cwd": "C:/raylib/w64devkit/bin"
-            },
+                "env": {
+                    "PATH": "C:/raylib/w64devkit/bin;${env:PATH}"
+                }
+            },  
             "problemMatcher": [
                 "$gcc"
             ],
