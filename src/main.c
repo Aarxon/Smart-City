@@ -1023,8 +1023,8 @@ static void UpdateOrbit(float dt) {
     if (IsKeyDown(KEY_E)) oc.yaw -= 1.6f * dt;
     if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
         Vector2 d = GetMouseDelta();
-        oc.yaw -= d.x * 0.005f;
-        oc.pitch += d.y * 0.005f;
+        oc.yaw -= d.x * ((float)SCREEN_W / GetScreenWidth()) * 0.005f;
+        oc.pitch += d.y * ((float)SCREEN_H / GetScreenHeight()) * 0.005f;
     }
     float w = GetMouseWheelMove();
     if (w != 0.0f) oc.dist -= w * 2.0f;
@@ -1204,6 +1204,7 @@ static void DrawWeatherFx(void) {
 // ---------------------------------------------------------------------------
 // UI panels
 // ---------------------------------------------------------------------------
+static Vector2 GetScaledMouse(void);
 static int uiY;
 static const Color COL_LABEL = { 170, 175, 185, 255 };
 
@@ -1233,7 +1234,7 @@ static void Alert(const char *s, int *n) {
 }
 
 static void DrawLeftPanel(void) {
-    Vector2 m = GetMousePosition();
+    Vector2 m = GetScaledMouse();
     DrawRectangle(0, 0, PANEL_W, SCREEN_H, COL_PANEL);
     DrawLine(PANEL_W - 1, 0, PANEL_W - 1, SCREEN_H, (Color){ 55, 65, 80, 255 });
     DrawText("SMART CITY CONTROL", 12, 8, 14, RAYWHITE);
@@ -1331,6 +1332,15 @@ static void DrawRightPanel(void) {
     DrawGraph(gx, y + 6 * pitch, gw, gh, G_CARS,   "Vehicles on road", (Color){ 240, 210, 50, 255 }, TextFormat("%d", st.vehicles), 20.0f, true);
 }
 
+// Convert physical fullscreen mouse coordinates to the original UI layout.
+static Vector2 GetScaledMouse(void) {
+    Vector2 m = GetMousePosition();
+    return (Vector2){
+        m.x * (float)SCREEN_W / (float)GetScreenWidth(),
+        m.y * (float)SCREEN_H / (float)GetScreenHeight()
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Input
 // ---------------------------------------------------------------------------
@@ -1343,7 +1353,7 @@ static void HandleInput(float dt) {
     if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) simSpeed = fmaxf(0.5f, simSpeed * 0.5f);
     if (IsKeyPressed(KEY_R)) ResetCamera();
 
-    Vector2 m = GetMousePosition();
+    Vector2 m = GetScaledMouse();
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         if (CheckCollisionPointRec(m, ViewBtnRect())) viewMode = (viewMode == VIEW_2D) ? VIEW_3D : VIEW_2D;
         for (int i = 0; i < L_COUNT; i++) if (CheckCollisionPointRec(m, LayerRect(i))) layerOn[i] = !layerOn[i];
@@ -1370,10 +1380,14 @@ static void HandleInput(float dt) {
 // ---------------------------------------------------------------------------
 int main(void) {
     InitWindow(SCREEN_W, SCREEN_H, "Smart City Simulator");
+    int monitor = GetCurrentMonitor();
+    SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
+    ToggleFullscreen();
     SetTargetFPS(60);
     SetRandomSeed((unsigned int)time(NULL));
 
     RenderTexture2D view = LoadRenderTexture(VIEW_W, VIEW_H);
+    RenderTexture2D screen = LoadRenderTexture(SCREEN_W, SCREEN_H);
 
     GenerateCity();
     ResetCamera();
@@ -1403,7 +1417,7 @@ int main(void) {
             DrawWeatherFx();
         EndTextureMode();
 
-        BeginDrawing();
+        BeginTextureMode(screen);
             ClearBackground(BLACK);
             DrawTextureRec(view.texture, (Rectangle){ 0, 0, (float)VIEW_W, -(float)VIEW_H }, (Vector2){ PANEL_W, 0 }, WHITE);
             DrawLeftPanel();
@@ -1417,10 +1431,20 @@ int main(void) {
                 DrawText("Pollution map: green = clean, purple = dirty", PANEL_W + 10, SCREEN_H - 17, 10, WHITE);
             }
             if (paused) DrawText("PAUSED", PANEL_W + VIEW_W / 2 - 40, 10, 20, YELLOW);
+        EndTextureMode();
+
+        // Stretch the complete interface to the actual fullscreen dimensions.
+        BeginDrawing();
+            ClearBackground(BLACK);
+            DrawTexturePro(screen.texture,
+                (Rectangle){ 0, 0, (float)SCREEN_W, -(float)SCREEN_H },
+                (Rectangle){ 0, 0, (float)GetScreenWidth(), (float)GetScreenHeight() },
+                (Vector2){ 0, 0 }, 0.0f, WHITE);
         EndDrawing();
     }
 
     UnloadRenderTexture(view);
+    UnloadRenderTexture(screen);
     CloseWindow();
     return 0;
 }
