@@ -1,0 +1,21 @@
+
+{
+    "version": "0.2.0",
+    "configurations": [
+      
+        {
+            "name": "Linux: Debug Smart City",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/smart-city",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "preLaunchTask": "Linux: Build Smart City"
+        }
+    ]
+}
