@@ -10,6 +10,7 @@
 //   Left click      Start a fire on a building / tree / grass tile
 //   SPACE           Trigger a storm
 //   P               Pause        + / -   Simulation speed
+//   T               Switch between the NORMAL city and the SMART city (also a button, top-left)
 //
 // Build (Linux/macOS):   gcc main.c -o city -lraylib -lm
 // Build (Windows/MinGW): gcc main.c -o city.exe -lraylib -lopengl32 -lgdi32 -lwinmm
@@ -33,7 +34,7 @@
 #define VIEW_W      (MAP_W * TILE)
 #define VIEW_H      (MAP_H * TILE)
 #define SCREEN_W    (VIEW_W + PANEL_W * 2)
-#define SCREEN_H    VIEW_H
+#define SCREEN_H    (VIEW_H + 64)       // map view + a status strip underneath
 
 #define SIDEWALK_W  5          // pixels (2D); scaled to tile units in 3D
 #define LINE_THICK  3
@@ -45,6 +46,9 @@
 #define MAX_PEDS    64
 #define MAX_TRUCKS  6
 #define MAX_POLICE  6
+#define MAX_AMB     3
+#define MAX_DRONES  14
+#define FARM_W      6          // width (tiles) of the renewable-energy strip east of the map (smart city)
 #define MAX_STN     4
 #define MAX_PART    900
 #define MAX_PATH    (MAP_W * MAP_H)
@@ -53,14 +57,14 @@
 #define WORKS_LPM   9000.0f    // output of one water works (litres/min)
 #define SEWER_CAP   8500.0f    // sewer capacity (litres/min)
 
-#define LAYER_Y0    62
+#define LAYER_Y0    84
 #define LAYER_H     16
 #define ROW_H       12
 
 typedef enum {
     T_GRASS = 0, T_ROAD, T_BUILDING, T_TREE, T_RUIN,
     T_FIRE_STN, T_POLICE_STN, T_POWER, T_WATER,
-    T_HOUSE, T_MALL, T_PARK, T_LANDFILL
+    T_HOUSE, T_MALL, T_PARK, T_LANDFILL, T_HOSPITAL
 } TileType;
 
 enum { B_RES = 0, B_COM, B_IND };
@@ -78,6 +82,7 @@ typedef struct {
     float t, ox, oy, wait, speedMul, stopT, speedNow, reportT, lostT;
     float arcU, arcFrom, arcSweep;
     int claimX, claimY, id, reportKind, pursuer;
+    int destX, destY;           // smart routing destination (road tile), -1 = none
     unsigned char type, colIdx;
     bool active, rogue, speeder, wanted, fleeing, arcing, braking;
     Color col;
@@ -90,6 +95,8 @@ typedef struct {
     int gx, gy, px, py;         // current node, previous node
     int cx, cy, fx, fy;         // crossing tile and far node (when crossing)
     bool crossing, started;
+    bool ill, illCalled;        // medical emergency / help already on its way
+    float illT, illSince;
     float robTimer, cooldown, phase, wait;
     bool active, criminal, robbing;
     unsigned char look;
@@ -106,6 +113,18 @@ typedef struct {
 } Responder;
 
 typedef struct { int x, y, rx, ry; } Station;
+
+// Smart-city emergency drones (fly straight, ignore roads)
+enum { D_POLICE = 0, D_FIRE, D_MEDIC };
+typedef struct {
+    bool active, carrying, spraying;
+    int kind, state;            // state: 0 outbound, 1 working, 2 carrying patient, 3 returning
+    float x, y, z;              // tile units + altitude
+    float tx, ty;               // current flight target
+    float yaw, work, scanT, lostT, since;
+    int pedTarget, carId, homeX, homeY;
+    float sx, sy;               // spray / beam target
+} Drone;
 
 typedef struct {
     Vector3 p, v;
@@ -212,8 +231,10 @@ static Car        cars[MAX_CARS];
 static Ped        peds[MAX_PEDS];
 static Responder  trucks[MAX_TRUCKS];
 static Responder  police[MAX_POLICE];
-static Station    fireStn[MAX_STN], policeStn[MAX_STN];
-static int        nFire = 0, nPolice = 0;
+static Station    fireStn[MAX_STN], policeStn[MAX_STN], hospStn[MAX_STN];
+static int        nFire = 0, nPolice = 0, nHosp = 0;
+static Responder  ambs[MAX_AMB];
+static Drone      drones[MAX_DRONES];
 static Particle   parts[MAX_PART];
 static int        carSerial = 1;
 
@@ -227,6 +248,18 @@ static float fireTimer = 0.0f, dispatchTimer = 0.0f, mapTimer = 0.0f, statTimer 
 static int   crimes = 0, arrests = 0, collapses = 0, births = 0, deaths = 0, robbingNow = 0;
 static int   offences = 0, reports = 0, caught = 0, escaped = 0, nBikes = 0, nPedsActive = 0;
 static float landfillFill = 22.0f;      // % of landfill capacity used
+
+// ---- smart city mode ----------------------------------------------------------
+static bool  smartCity = false;
+static float roofSolarKW = 0, farmSolarKW = 0, windKW = 0, gridImportKW = 0, batteryPct = 55.0f;
+static float windSpeed = 0.5f, windTarget = 0.5f, windTimer = 0.0f, renewPct = 0.0f;
+static int   solarRoofs = 0;
+static float recycledT = 0.0f, wasteT = 0.0f;       // cumulative tonnes recycled / sent to landfill
+static int   droneSorties = 0, reroutes = 0;
+static int   medCalls = 0, medSaved = 0, medLost = 0, respN = 0, transN = 0;
+static float respSum = 0.0f, transSum = 0.0f, medTimer = 8.0f, avgSpeed = 0.0f;
+static bool  monitorTile[MAP_H][MAP_W];             // smart traffic monitor masts
+static float hospTimer = 0.0f;
 
 static float hist[G_COUNT][HIST];
 static int   histIdx = 0;
@@ -252,7 +285,7 @@ static const float VWID[V_COUNT] = { 0.115f, 0.11f, 0.115f, 0.12f, 0.125f, 0.125
 static float Rf(void) { return GetRandomValue(0, 10000) / 10000.0f; }
 static bool InBounds(int x, int y) { return x >= 0 && x < MAP_W && y >= 0 && y < MAP_H; }
 static bool IsRoad(int x, int y) { return InBounds(x, y) && surface[y][x] == T_ROAD; }
-static bool IsBldg(int s) { return s == T_BUILDING || s == T_HOUSE || s == T_MALL; }
+static bool IsBldg(int s) { return s == T_BUILDING || s == T_HOUSE || s == T_MALL || s == T_HOSPITAL; }
 static bool Flammable(int x, int y) {
     int s = surface[y][x];
     return IsBldg(s) || s == T_TREE || s == T_GRASS;
@@ -320,13 +353,27 @@ static int SidewalkRects(int x, int y, Rectangle *r) {
     return n;
 }
 
-// ---- Traffic signals: 0 = red, 1 = green, 2 = yellow. axis 0 = N-S traffic, 1 = E-W traffic
+// ---- Traffic signals (phase machine, see UpdateSignals): 0 = red, 1 = green, 2 = yellow.
+// axis 0 = N-S traffic, 1 = E-W traffic.  Phases: 0 A green, 1 A yellow, 2 all red, 3 B green, 4 B yellow, 5 all red.
+static unsigned char sigPhase[MAP_H][MAP_W];
+static float         sigT[MAP_H][MAP_W];
+static float SigMinDur(int ph) { return (ph == 0 || ph == 3) ? (smartCity ? 5.0f : 9.0f) : ((ph == 1 || ph == 4) ? 2.0f : 1.0f); }
+
+// redLeft = a lower bound on the seconds until this axis turns green (0 when it is not red)
 static int SigState(int x, int y, int axis, float *redLeft) {
-    float ta = fmodf(simTime + sigOff[y][x] + (axis ? 12.0f : 0.0f), SIG_CYCLE);
-    if (redLeft) *redLeft = (ta >= 11.0f) ? (SIG_CYCLE - ta) : 0.0f;
-    if (ta < 9.0f) return 1;
-    if (ta < 11.0f) return 2;
-    return 0;
+    int ph = sigPhase[y][x], gp = axis ? 3 : 0, yp = gp + 1;
+    int s = (ph == gp) ? 1 : (ph == yp ? 2 : 0);
+    if (redLeft) {
+        float left = 0.0f;
+        if (s == 0) {
+            for (int p = ph; p != gp; p = (p + 1) % 6) {
+                float d = SigMinDur(p);
+                left += (p == ph) ? fmaxf(d - sigT[y][x], 0.0f) : d;
+            }
+        }
+        *redLeft = left;
+    }
+    return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +382,7 @@ static int SigState(int x, int y, int axis, float *redLeft) {
 enum {
     TX_BRICK = 0, TX_SIDING, TX_STUCCO, TX_ROOF, TX_GRASS, TX_ASPHALT, TX_CONCRETE, TX_CORRUG,
     TX_BARK, TX_HEDGE, TX_TRASH, TX_WIN_GLASS, TX_WIN_GLASS_N, TX_WIN_BRICK, TX_WIN_BRICK_N,
-    TX_WIN_OFFICE, TX_WIN_OFFICE_N, TX_POLICE, TX_FIRE, TX_VAN, TX_COUNT
+    TX_WIN_OFFICE, TX_WIN_OFFICE_N, TX_POLICE, TX_FIRE, TX_VAN, TX_SOLAR, TX_AMBU, TX_HOSP, TX_COUNT
 };
 static Texture2D tex[TX_COUNT];
 #define WIN_ROWS 24          // floors available in the window textures (16 px per floor)
@@ -462,6 +509,37 @@ static Texture2D MakeVanTex(void) {
     return Finish(img);
 }
 
+static Texture2D MakeSolarTex(void) {
+    Image img = GenImageColor(64, 64, (Color){ 22, 42, 92, 255 });
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 64; x++) {
+            Color c = (Color){ 24, 48, 108, 255 };
+            if (((x % 16) == 0) || ((y % 16) == 0)) c = (Color){ 150, 165, 190, 255 };       // cell gridlines
+            else if ((x % 16) == 8) c = (Color){ 40, 70, 140, 255 };                          // busbar
+            ImageDrawPixel(&img, x, y, Jitter(c, 0.10f, x, y, 9));
+        }
+    return Finish(img);
+}
+static Texture2D MakeAmbulanceTex(void) {
+    Image img = GenImageColor(64, 64, (Color){ 244, 246, 248, 255 });
+    for (int x = 0; x < 64; x += 8)
+        for (int r = 0; r < 2; r++)
+            ImageDrawRectangle(&img, x, 34 + r * 8, 8, 8, ((x / 8 + r) & 1) ? (Color){ 250, 215, 30, 255 } : (Color){ 30, 150, 80, 255 });
+    ImageDrawText(&img, "AMBULANCE", 2, 18, 9, (Color){ 30, 120, 70, 255 });
+    ImageDrawRectangle(&img, 0, 52, 64, 3, (Color){ 30, 150, 80, 255 });
+    return Finish(img);
+}
+static Texture2D MakeHospitalTex(void) {
+    Image img = GenImageColor(64, 16 * 4, (Color){ 238, 240, 244, 255 });
+    for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) ImageDrawPixel(&img, x, y, Jitter((Color){ 238, 240, 244, 255 }, 0.06f, x, y, 12));
+    for (int f = 0; f < 4; f++)
+        for (int c = 0; c < 4; c++) {
+            ImageDrawRectangle(&img, c * 16 + 2, f * 16 + 4, 12, 8, (Color){ 120, 130, 145, 255 });
+            ImageDrawRectangle(&img, c * 16 + 3, f * 16 + 5, 10, 6, (Color){ 120, 185, 220, 255 });
+        }
+    return Finish(img);
+}
+
 static void MakeTextures(void) {
     tex[TX_BRICK]    = MakeBrick();
     tex[TX_SIDING]   = MakeSiding();
@@ -483,6 +561,9 @@ static void MakeTextures(void) {
     tex[TX_POLICE]   = MakePoliceTex();
     tex[TX_FIRE]     = MakeFireTex();
     tex[TX_VAN]      = MakeVanTex();
+    tex[TX_SOLAR]    = MakeSolarTex();
+    tex[TX_AMBU]     = MakeAmbulanceTex();
+    tex[TX_HOSP]     = MakeHospitalTex();
 }
 
 static void FreeTextures(void) { for (int i = 0; i < TX_COUNT; i++) UnloadTexture(tex[i]); }
@@ -768,9 +849,10 @@ static void GenerateCity(void) {
     PlaceFixed(19, 4, T_FIRE_STN);
     PlaceFixed(10, 2, T_POLICE_STN);
     PlaceFixed(3, 11, T_POLICE_STN);
+    PlaceFixed(6, 2, T_HOSPITAL); bHeight[2][6] = 0.55f; bType[2][6] = B_COM;
     PlaceFixed(12, 6, T_POWER);
     PlaceFixed(17, 6, T_WATER);
-    faceDir[2][2] = 1; faceDir[4][19] = 3; faceDir[2][10] = 3; faceDir[11][3] = 3;
+    faceDir[2][6] = 1; faceDir[2][2] = 1; faceDir[4][19] = 3; faceDir[2][10] = 3; faceDir[11][3] = 3;
 
     // ---- Utility pipes: every road plus every built tile touching a road ------
     for (int y = 0; y < MAP_H; y++)
@@ -786,6 +868,13 @@ static void GenerateCity(void) {
             int x = roadCols[c], y = roadRows[r];
             ctrl[y][x] = junction[r][c];
             sigOff[y][x] = Rf() * SIG_CYCLE;
+            {   // start the signal phase machine at a random point of the 24 s cycle
+                float ta = sigOff[y][x];
+                static const float dur[6] = { 9, 2, 1, 9, 2, 1 };
+                int ph = 0;
+                while (ta >= dur[ph]) { ta -= dur[ph]; ph++; if (ph > 5) { ph = 5; break; } }
+                sigPhase[y][x] = (unsigned char)ph; sigT[y][x] = ta;
+            }
         }
 
     // ---- Sidewalk graph + pedestrian crossings ----------------------------------
@@ -819,7 +908,7 @@ static void GenerateCity(void) {
     }
 
     // ---- Register stations --------------------------------------------------------
-    nFire = nPolice = 0;
+    nFire = nPolice = nHosp = 0;
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) {
             int rx, ry;
@@ -827,9 +916,24 @@ static void GenerateCity(void) {
                 fireStn[nFire++] = (Station){ x, y, rx, ry };
             if (surface[y][x] == T_POLICE_STN && nPolice < MAX_STN && FindAccess(x, y, &rx, &ry))
                 policeStn[nPolice++] = (Station){ x, y, rx, ry };
+            if (surface[y][x] == T_HOSPITAL && nHosp < MAX_STN && FindAccess(x, y, &rx, &ry))
+                hospStn[nHosp++] = (Station){ x, y, rx, ry };
+        }
+
+    // ---- smart traffic monitor masts: straight road tiles two steps out from every junction ----
+    memset(monitorTile, 0, sizeof(monitorTile));
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) {
+            if (!IsRoad(x, y) || ctrl[y][x] == C_NONE) continue;
+            for (int d = 0; d < 4; d++) {
+                int mx = x + 2 * DX[d], my = y + 2 * DY[d];
+                if (IsRoad(mx, my) && RoadNeighbours(mx, my) == 2 && RoadLine(mx, my) != 0 && !crossT[my][mx]) monitorTile[my][mx] = true;
+            }
         }
 
     memset(cars, 0, sizeof(cars));
+    memset(ambs, 0, sizeof(ambs));
+    memset(drones, 0, sizeof(drones));
     memset(peds, 0, sizeof(peds));
     memset(trucks, 0, sizeof(trucks));
     memset(police, 0, sizeof(police));
@@ -927,9 +1031,9 @@ static int RandTrafficType(void) {
     if (r < 29) return V_SALOON;
     if (r < 50) return V_HATCH;
     if (r < 62) return V_ESTATE;
-    if (r < 71) return V_PICKUP;
-    if (r < 87) return V_SUV;
-    if (r < 95) return V_VAN;
+    if (r < 72) return V_PICKUP;
+    if (r < 88) return V_SUV;
+    if (r < 97) return V_VAN;
     return V_TRUCK;
 }
 
@@ -951,7 +1055,7 @@ static int SpawnCarAt(int x, int y, int type, int colIdx, bool allowRogue) {
     c->dir = valid[GetRandomValue(0, nv - 1)];
     c->gx = c->tx = x; c->gy = c->ty = y; c->t = 1.0f;
     c->x = x + 0.5f; c->y = y + 0.5f; c->yaw = FaceYaw(c->dir);
-    c->claimX = c->claimY = -1; c->pursuer = -1;
+    c->claimX = c->claimY = -1; c->pursuer = -1; c->destX = c->destY = -1;
     c->speedMul = 0.88f + Rf() * 0.24f;
     if (allowRogue && type != V_TRUCK) {
         c->rogue = (Rf() < 0.07f);
@@ -979,10 +1083,77 @@ static void Violation(Car *c, int kind) {
     if (witness && Rf() < 0.6f) { c->reportT = 1.2f + Rf() * 2.0f; c->reportKind = kind; }
 }
 
+static bool LaunchDrone(int kind, float tx, float ty, int pedIdx, int carId);
+
 static void ReportCar(Car *c) {
     c->wanted = true;
     reports++;
-    if (!Dispatch(police, MAX_POLICE, policeStn, nPolice, c->gx, c->gy, -1, 0, 1, c->id)) c->wanted = false;
+    bool ok = smartCity ? LaunchDrone(D_POLICE, c->x, c->y, -1, c->id)
+                        : Dispatch(police, MAX_POLICE, policeStn, nPolice, c->gx, c->gy, -1, 0, 1, c->id);
+    if (!ok) c->wanted = false;
+}
+
+// ---------------------------------------------------------------------------
+// Smart routing: the road monitors report congestion and every car is steered along the
+// quickest route to its destination (Dijkstra over the road graph, cost grows with traffic).
+// ---------------------------------------------------------------------------
+static int roadList[MAP_W * MAP_H], nRoadList = 0;
+static unsigned char stopWhy[MAX_CARS];      // diagnostics: 1 signal, 2 roundabout, 3 stop sign, 4 pedestrians, 5 queue
+
+static float queueMap[MAP_H][MAP_W];         // smoothed number of stopped cars per tile (from the road monitors)
+
+static float StepCost(int x, int y, bool useCong) {
+    float c = 1.0f;
+    if (ctrl[y][x] == C_SIGNAL) c += 5.0f; else if (ctrl[y][x] == C_STOP) c += 2.5f; else if (ctrl[y][x] == C_ROUNDABOUT) c += 1.2f;
+    if (useCong) c += 2.0f * traffic[y][x] + 5.0f * queueMap[y][x];
+    return c;
+}
+
+static void RouteField(int gx, int gy, bool useCong, float *dist) {
+    static bool done[MAP_W * MAP_H];
+    if (nRoadList == 0) for (int i = 0; i < MAP_W * MAP_H; i++) if (IsRoad(i % MAP_W, i / MAP_W)) roadList[nRoadList++] = i;
+    for (int k = 0; k < nRoadList; k++) { dist[roadList[k]] = 1e9f; done[roadList[k]] = false; }
+    dist[gy * MAP_W + gx] = 0.0f;
+    for (;;) {
+        int b = -1; float bd = 1e9f;
+        for (int k = 0; k < nRoadList; k++) { int i = roadList[k]; if (!done[i] && dist[i] < bd) { bd = dist[i]; b = i; } }
+        if (b < 0) break;
+        done[b] = true;
+        int bx = b % MAP_W, by = b / MAP_W;
+        float step = StepCost(bx, by, useCong);
+        for (int d = 0; d < 4; d++) {
+            int nx = bx + DX[d], ny = by + DY[d];
+            if (!IsRoad(nx, ny)) continue;
+            int n = ny * MAP_W + nx;
+            if (!done[n] && bd + step < dist[n]) dist[n] = bd + step;
+        }
+    }
+}
+
+static int SmartChoose(Car *c, const int *opts, int no) {
+    if (no <= 0) return -1;
+    if (c->destX < 0 || (c->gx == c->destX && c->gy == c->destY)) {
+        c->destX = -1;
+        for (int k = 0; k < 30; k++) {
+            int x = GetRandomValue(0, MAP_W - 1), y = GetRandomValue(0, MAP_H - 1);
+            if (IsRoad(x, y) && abs(x - c->gx) + abs(y - c->gy) >= 7) { c->destX = x; c->destY = y; break; }
+        }
+        if (c->destX < 0) return -1;
+    }
+    static float dC[MAP_W * MAP_H], dF[MAP_W * MAP_H];
+    RouteField(c->destX, c->destY, true, dC);
+    RouteField(c->destX, c->destY, false, dF);
+    int bestC = -1, bestF = -1; float sC = 1e9f, sF = 1e9f;
+    for (int k = 0; k < no; k++) {
+        int nx = c->gx + DX[opts[k]], ny = c->gy + DY[opts[k]];
+        int n = ny * MAP_W + nx;
+        float jit = Rf() * 0.02f;
+        float vc = StepCost(nx, ny, true) + dC[n] + jit, vf = StepCost(nx, ny, false) + dF[n] + jit;
+        if (vc < sC) { sC = vc; bestC = opts[k]; }
+        if (vf < sF) { sF = vf; bestF = opts[k]; }
+    }
+    if (bestC >= 0 && bestC != bestF) reroutes++;       // the monitors steered this car off the shortest route
+    return bestC;
 }
 
 static bool LaneBlocked(const Car *c, float *gapOut) {
@@ -1001,8 +1172,8 @@ static bool LaneBlocked(const Car *c, float *gapOut) {
 
 #define STOP_LINE 0.70f
 static void UpdateCars(float dt) {
-    static float cnt[MAP_H][MAP_W];
-    memset(cnt, 0, sizeof(cnt));
+    static float cnt[MAP_H][MAP_W], cntStop[MAP_H][MAP_W];
+    memset(cnt, 0, sizeof(cnt)); memset(cntStop, 0, sizeof(cntStop));
 
     int active = 0, bikes = 0;
     for (int i = 0; i < MAX_CARS; i++) if (cars[i].active) { if (cars[i].type == V_BIKE) bikes++; else active++; }
@@ -1027,6 +1198,7 @@ static void UpdateCars(float dt) {
     }
 
     int n = 0, jammed = 0, nb = 0;
+    float spdSum = 0.0f;
     for (int i = 0; i < MAX_CARS; i++) {
         Car *c = &cars[i];
         if (!c->active) continue;
@@ -1056,7 +1228,7 @@ static void UpdateCars(float dt) {
             if (c->arcU >= 1.0f) { c->arcing = false; c->t = 0.0f; if (c->claimX >= 0) ReleaseClaim(c); }
         } else {
             // ---- rules of the road: stop lines, give way, pedestrian crossings -----------
-            bool must = false;
+            bool must = false; int why = 0;
             int tx = c->tx, ty = c->ty;
             bool moving = (tx != c->gx || ty != c->gy);
             if (moving && crossT[ty][tx] && c->t < 0.98f) {
@@ -1069,26 +1241,26 @@ static void UpdateCars(float dt) {
                         int ix = ji % MAP_W, iy = ji / MAP_W;
                         if (ctrl[iy][ix] == C_SIGNAL) {
                             int s = SigState(ix, iy, c->dir < 2 ? 0 : 1, NULL);
-                            if (s != 1 && !c->rogue && !c->fleeing && c->t <= STOP_LINE + 0.08f) must = true;
+                            if (s != 1 && !c->rogue && !c->fleeing && c->t <= STOP_LINE + 0.08f) { must = true; why = 1; }
                             if (s == 0 && (c->rogue || c->fleeing) && prevT < STOP_LINE && prevT + dt * v >= STOP_LINE && c->lostT <= 0.0f) {
                                 Violation(c, 1); c->lostT = 6.0f;
                             }
                         } else if (ctrl[iy][ix] == C_ROUNDABOUT) {
                             if (c->claimX < 0 && !c->fleeing) {
-                                if (nodeOcc[iy][ix] > 0 && c->t >= STOP_LINE - 0.02f) must = true;
+                                if (nodeOcc[iy][ix] > 0 && c->t >= STOP_LINE - 0.02f) { must = true; why = 2; }
                                 else if (c->t >= STOP_LINE - 0.02f) { c->claimX = ix; c->claimY = iy; nodeOcc[iy][ix]++; }
                             }
                         } else if (ctrl[iy][ix] == C_STOP) {
                             if (c->claimX < 0 && !c->rogue && !c->fleeing) {
                                 if (c->t >= STOP_LINE - 0.02f) {
                                     c->stopT += dt;
-                                    if (c->stopT < 1.0f || nodeOcc[iy][ix] > 0) must = true;
+                                    if (c->stopT < 1.0f || nodeOcc[iy][ix] > 0) { must = true; why = 3; }
                                     else { c->claimX = ix; c->claimY = iy; nodeOcc[iy][ix]++; }
                                 }
                             }
                         }
                     }
-                    if (crossBusy[ty][tx] > 0 && c->t <= STOP_LINE + 0.12f) must = true;     // give way to pedestrians
+                    if (crossBusy[ty][tx] > 0 && c->t <= STOP_LINE + 0.12f) { must = true; why = 4; }     // give way to pedestrians
                 }
             }
             if (must && c->t >= STOP_LINE - 0.03f) { v = 0.0f; c->braking = true; }
@@ -1099,7 +1271,7 @@ static void UpdateCars(float dt) {
                 c->wait += dt;
                 if (c->wait < 4.0f) { v = 0.0f; c->braking = true; }   // after 4 s creep on (gridlock breaker)
             } else c->wait = 0.0f;
-            if (v == 0.0f) jammed++;
+            if (v == 0.0f) { jammed++; stopWhy[i] = (unsigned char)(c->braking && why ? why : 5); } else stopWhy[i] = 0;
 
             if (c->speeder && v > 2.9f && !c->wanted && c->lostT <= 0.0f && !c->fleeing) { Violation(c, 2); c->lostT = 8.0f; }
 
@@ -1125,6 +1297,8 @@ static void UpdateCars(float dt) {
                             float dd = px * px + py * py;
                             if (dd > bestD) { bestD = dd; choice = opts[k]; }
                         }
+                    } else if (smartCity && !c->fleeing && no > 0 && (choice = SmartChoose(c, opts, no)) >= 0) {
+                        // smart-routed
                     } else if (straight && Rf() < 0.6f) choice = c->dir;
                     else choice = (no > 0) ? opts[GetRandomValue(0, no - 1)] : valid[0];
                 }
@@ -1162,16 +1336,18 @@ static void UpdateCars(float dt) {
         }
         c->speedNow = (dt > 0.0f) ? sqrtf((c->x - ox0) * (c->x - ox0) + (c->y - oy0) * (c->y - oy0)) / dt : 0.0f;
 
+        spdSum += c->speedNow;
         int cx = (int)c->x, cy = (int)c->y;
-        if (InBounds(cx, cy)) cnt[cy][cx] += 1.0f;
+        if (InBounds(cx, cy)) { cnt[cy][cx] += 1.0f; if (c->speedNow < 0.15f) cntStop[cy][cx] += 1.0f; }
     }
     st.vehicles = n;
     st.jammed = jammed;
+    avgSpeed += ((n ? spdSum / n : 0.0f) - avgSpeed) * Clamp(dt * 0.4f, 0.0f, 1.0f);
     nBikes = nb;
 
     float k = Clamp(dt * 2.0f, 0.0f, 1.0f);
     for (int y = 0; y < MAP_H; y++)
-        for (int x = 0; x < MAP_W; x++) traffic[y][x] += (cnt[y][x] - traffic[y][x]) * k;
+        for (int x = 0; x < MAP_W; x++) { traffic[y][x] += (cnt[y][x] - traffic[y][x]) * k; queueMap[y][x] += (cntStop[y][x] - queueMap[y][x]) * k; }
 }
 
 // ---------------------------------------------------------------------------
@@ -1359,6 +1535,11 @@ static void UpdatePeds(float dt) {
             if (act < target && GetRandomValue(0, 1000) < 14) { SpawnPed(p); if (p->active) act++; }
             continue;
         }
+        if (p->ill) {                               // collapsed: waits for help
+            p->illT += dt;
+            if (p->illT > 80.0f) { p->active = false; p->ill = false; deaths++; medLost++; }
+            continue;
+        }
         if (p->robbing) {
             robbingNow++;
             p->robTimer += dt;
@@ -1503,8 +1684,8 @@ static void EmitChimneys(float dt) {
         for (int x = 0; x < MAP_W; x++) {
             float rate = 0.0f, hh = 0.0f, ox = 0.0f, oz = 0.0f;
             if (surface[y][x] == T_BUILDING && bType[y][x] == B_IND && deco[y][x] == 0 && fireI[y][x] <= 0.0f) {
-                rate = 2.4f; hh = bHeight[y][x] + 0.40f; ox = 0.2f; oz = -0.2f;
-            } else if (surface[y][x] == T_POWER) {
+                rate = smartCity ? 0.35f : 2.4f; hh = bHeight[y][x] + 0.40f; ox = 0.2f; oz = -0.2f;      // smoke traps scrub the flue gas
+            } else if (surface[y][x] == T_POWER && !smartCity) {
                 rate = 1.5f + 4.0f * st.powerLoad; hh = 1.0f; ox = -0.22f; oz = 0.0f;
             }
             if (rate <= 0.0f) continue;
@@ -1691,14 +1872,316 @@ static void UpdateDispatch(void) {
             bool covered = false;
             for (int t = 0; t < MAX_TRUCKS; t++)
                 if (trucks[t].active && abs(trucks[t].targetX - x) <= 3 && abs(trucks[t].targetY - y) <= 3) covered = true;
-            if (!covered) Dispatch(trucks, MAX_TRUCKS, fireStn, nFire, x, y, -1, 3, 0, 0);
+            for (int k = 0; k < MAX_DRONES; k++)
+                if (drones[k].active && drones[k].kind == D_FIRE && drones[k].state < 3 &&
+                    (fabsf(drones[k].tx - (x + 0.5f)) <= 3.0f && fabsf(drones[k].ty - (y + 0.5f)) <= 3.0f)) covered = true;
+            if (!covered) {
+                if (smartCity) LaunchDrone(D_FIRE, x + 0.5f, y + 0.5f, -1, -1);     // fire drone scrambles from the station
+                else           Dispatch(trucks, MAX_TRUCKS, fireStn, nFire, x, y, -1, 3, 0, 0);
+            }
         }
     for (int i = 0; i < MAX_PEDS; i++) {
         if (!(peds[i].active && peds[i].criminal && peds[i].robbing)) continue;
         bool assigned = false;
         for (int p = 0; p < MAX_POLICE; p++) if (police[p].active && police[p].mode == 0 && police[p].pedTarget == i) assigned = true;
-        if (!assigned) Dispatch(police, MAX_POLICE, policeStn, nPolice, (int)peds[i].x, (int)peds[i].y, i, 3, 0, 0);
+        for (int k = 0; k < MAX_DRONES; k++) if (drones[k].active && drones[k].kind == D_POLICE && drones[k].pedTarget == i) assigned = true;
+        if (!assigned) {
+            if (smartCity) LaunchDrone(D_POLICE, peds[i].x, peds[i].y, i, -1);
+            else           Dispatch(police, MAX_POLICE, policeStn, nPolice, (int)peds[i].x, (int)peds[i].y, i, 3, 0, 0);
+        }
     }
+}
+// ---------------------------------------------------------------------------
+// Smart city: drones (police / fire / medical), ambulances, wind + renewable energy
+// ---------------------------------------------------------------------------
+#define DR_CRUISE   2.7f
+#define DR_SPEED    6.4f
+#define BATT_KWS    420000.0f      // battery bank size in kW-seconds
+
+// Renewable farm strip east of the map (tile x = MAP_W .. MAP_W + FARM_W - 1)
+#define FARM_ROAD_Y   9
+#define FARM_SOLAR_X0 MAP_W
+#define FARM_SOLAR_X1 (MAP_W + 4)          // inclusive
+#define FARM_SOLAR_Y0 0
+#define FARM_SOLAR_Y1 7                    // inclusive
+#define N_TURB        8
+static const float TURB_POS[N_TURB][2] = {
+    { 29.5f, 1.5f }, { 29.5f, 4.0f }, { 29.5f, 6.5f }, { 26.5f, 11.5f },
+    { 28.5f, 11.5f }, { 25.8f, 14.3f }, { 27.8f, 14.3f }, { 29.6f, 14.3f }
+};
+#define TURB_KW       900.0f
+#define SOLAR_TILE_KW 110.0f
+
+// part of the landfill site is converted into a recycling plant in the smart city
+static bool IsRecycleTile(int x, int y) { return smartCity && surface[y][x] == T_LANDFILL && x <= 20; }
+
+static float SunK(void) { return powf(Clamp(st.daylight, 0.0f, 1.0f), 1.3f) * (1.0f - 0.7f * rain); }
+static float WindFactor(void) { return Clamp((windSpeed - 0.12f) / 0.55f, 0.0f, 1.0f); }
+
+static void UpdateWind(float dt) {
+    windTimer -= dt;
+    if (windTimer <= 0.0f) { windTimer = 18.0f + Rf() * 25.0f; windTarget = 0.12f + Rf() * 0.85f; }
+    float tgt = Clamp(windTarget + rain * 0.25f, 0.0f, 1.0f);
+    windSpeed += (tgt - windSpeed) * Clamp(dt * 0.25f, 0.0f, 1.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Drones
+// ---------------------------------------------------------------------------
+static bool LaunchDrone(int kind, float tx, float ty, int pedIdx, int carId) {
+    Station *stn; int n;
+    if (kind == D_POLICE)    { stn = policeStn; n = nPolice; }
+    else if (kind == D_FIRE) { stn = fireStn;   n = nFire; }
+    else                     { stn = hospStn;   n = nHosp; }
+    if (n == 0) return false;
+    int best = 0, bd = 1 << 30;
+    for (int i = 0; i < n; i++) {
+        int d = abs(stn[i].x - (int)tx) + abs(stn[i].y - (int)ty);
+        if (d < bd) { bd = d; best = i; }
+    }
+    int slot = -1;
+    for (int i = 0; i < MAX_DRONES; i++) if (!drones[i].active) { slot = i; break; }
+    if (slot < 0) return false;
+    Drone *d = &drones[slot];
+    memset(d, 0, sizeof(*d));
+    d->active = true; d->kind = kind; d->state = 0;
+    d->x = stn[best].x + 0.5f; d->y = stn[best].y + 0.5f;
+    d->z = (kind == D_MEDIC) ? 0.70f : 0.50f;
+    d->tx = tx; d->ty = ty; d->homeX = stn[best].x; d->homeY = stn[best].y;
+    d->pedTarget = pedIdx; d->carId = carId; d->since = (float)simTime;
+    droneSorties++;
+    return true;
+}
+
+// move horizontally towards (tx,ty); returns the distance that was left before the move
+static float DroneStep(Drone *d, float tx, float ty, float speed, float dt) {
+    float dx = tx - d->x, dy = ty - d->y, dist = sqrtf(dx * dx + dy * dy), step = speed * dt;
+    if (dist > 0.04f) d->yaw = atan2f(dx, dy) * RAD2DEG;
+    if (dist <= step) { d->x = tx; d->y = ty; } else { d->x += dx / dist * step; d->y += dy / dist * step; }
+    return dist;
+}
+static void DroneAlt(Drone *d, float target, float dt) {
+    float dz = target - d->z, m = 2.4f * dt;
+    d->z += Clamp(dz, -m, m);
+}
+static float DroneHomeZ(const Drone *d) { return (d->kind == D_MEDIC) ? 0.70f : 0.50f; }
+
+static void DroneReturn(Drone *d, float dt) {
+    float dist = DroneStep(d, d->homeX + 0.5f, d->homeY + 0.5f, DR_SPEED, dt);
+    if (dist > 0.6f) DroneAlt(d, DR_CRUISE, dt);
+    else             DroneAlt(d, DroneHomeZ(d), dt);
+    if (dist < 0.05f && d->z <= DroneHomeZ(d) + 0.03f) d->active = false;
+}
+
+static void UpdateDrone(Drone *d, float dt) {
+    d->spraying = false;
+    switch (d->kind) {
+    case D_FIRE: {
+        if (d->state == 0) {
+            float dist = DroneStep(d, d->tx, d->ty, 5.8f, dt);
+            DroneAlt(d, DR_CRUISE, dt);
+            if (dist < 0.1f) { d->state = 1; d->work = 0.0f; d->lostT = 0.0f; }
+        } else if (d->state == 1) {
+            d->work += dt;
+            DroneAlt(d, 2.2f, dt);
+            bool any = false; float bestI = 0.0f;
+            int cx = (int)d->x, cy = (int)d->y;
+            for (int yy = cy - 2; yy <= cy + 2; yy++)
+                for (int xx = cx - 2; xx <= cx + 2; xx++) {
+                    if (!InBounds(xx, yy) || fireI[yy][xx] <= 0.0f) continue;
+                    float dx = xx + 0.5f - d->x, dy = yy + 0.5f - d->y;
+                    if (dx * dx + dy * dy < 1.7f * 1.7f) {
+                        fireI[yy][xx] -= 52.0f * dt; any = true;
+                        if (fireI[yy][xx] > bestI) { bestI = fireI[yy][xx]; d->sx = xx + 0.5f; d->sy = yy + 0.5f; }
+                    }
+                }
+            d->spraying = any;
+            if (any) d->lostT = 0.0f;
+            else {
+                d->lostT += dt;
+                float bd = 1e9f; float nx = 0, ny = 0; bool found = false;     // look for the next burning tile nearby
+                for (int yy = cy - 4; yy <= cy + 4; yy++)
+                    for (int xx = cx - 4; xx <= cx + 4; xx++) {
+                        if (!InBounds(xx, yy) || fireI[yy][xx] <= 0.0f) continue;
+                        float dx = xx + 0.5f - d->x, dy = yy + 0.5f - d->y, dd = dx * dx + dy * dy;
+                        if (dd < bd) { bd = dd; nx = xx + 0.5f; ny = yy + 0.5f; found = true; }
+                    }
+                if (found) { DroneStep(d, nx, ny, 3.5f, dt); d->lostT = 0.0f; }
+            }
+            if (d->lostT > 1.5f || d->work > 45.0f) d->state = 3;
+        } else DroneReturn(d, dt);
+    } break;
+
+    case D_POLICE: {
+        if (d->state == 3) { DroneReturn(d, dt); break; }
+        if (d->pedTarget >= 0) {                                   // crime in progress
+            Ped *p = &peds[d->pedTarget];
+            if (!p->active || !p->criminal) { d->state = 3; break; }
+            float dist = DroneStep(d, p->x, p->y, DR_SPEED, dt);
+            DroneAlt(d, dist < 1.0f ? 1.1f : DR_CRUISE, dt);
+            if (dist < 0.35f) {
+                d->work += dt;
+                if (d->work > 1.6f) { p->active = false; arrests++; d->state = 3; }
+            }
+            d->sx = p->x; d->sy = p->y; d->spraying = (dist < 2.5f);      // spotlight beam
+        } else {                                                   // reported vehicle: track it from above
+            int ci = FindCarById(d->carId);
+            if (ci < 0) { d->state = 3; break; }
+            Car *c = &cars[ci];
+            float dist = DroneStep(d, c->x, c->y, DR_SPEED, dt);
+            DroneAlt(d, dist < 3.0f ? 1.3f : DR_CRUISE, dt);
+            d->work += dt;
+            d->sx = c->x; d->sy = c->y; d->spraying = (dist < 3.5f);
+            if (dist < 3.2f && !c->fleeing) { c->fleeing = true; c->pursuer = -1; }
+            d->lostT = (dist < 0.8f) ? d->lostT + dt : fmaxf(0.0f, d->lostT - dt);
+            if (d->lostT > 1.6f) {                                  // locked on: car is stopped
+                bool got = Rf() > (0.10f + rain * 0.30f);           // storms can break the lock
+                ResolveWanted(c, got); d->state = 3;
+            } else if (d->work > 45.0f) { ResolveWanted(c, false); d->state = 3; }
+        }
+    } break;
+
+    case D_MEDIC: {
+        Ped *p = (d->pedTarget >= 0) ? &peds[d->pedTarget] : NULL;
+        if (d->state == 0) {
+            if (!p || !p->active || !p->ill) { d->state = 3; break; }
+            float dist = DroneStep(d, p->x, p->y, DR_SPEED, dt);
+            DroneAlt(d, dist < 0.3f ? 0.12f : DR_CRUISE, dt);
+            if (dist < 0.12f && d->z < 0.2f) {
+                d->state = 1; d->work = 0.0f;
+                respSum += (float)simTime - p->illSince; respN++;
+            }
+        } else if (d->state == 1) {
+            d->work += dt;
+            DroneAlt(d, 0.12f, dt);
+            if (d->work > 2.0f) {
+                if (p && p->active && p->ill) { d->since = p->illSince; p->active = false; d->carrying = true; d->state = 2; }
+                else d->state = 3;
+            }
+        } else if (d->state == 2) {
+            float hx = hospStn[0].x + 0.5f, hy = hospStn[0].y + 0.5f;
+            float dist = DroneStep(d, hx, hy, DR_SPEED, dt);
+            DroneAlt(d, dist < 0.6f ? 0.70f : DR_CRUISE, dt);
+            if (dist < 0.05f && d->z <= 0.73f) {
+                medSaved++; transSum += (float)simTime - d->since; transN++;
+                d->carrying = false; d->active = false;
+            }
+        } else DroneReturn(d, dt);
+    } break;
+    }
+}
+
+static void UpdateDrones(float dt) {
+    for (int i = 0; i < MAX_DRONES; i++) if (drones[i].active) UpdateDrone(&drones[i], dt);
+}
+
+// ---------------------------------------------------------------------------
+// Ambulances (normal city) and the medical-emergency generator (both modes)
+// ---------------------------------------------------------------------------
+static void UpdateAmbulances(float dt) {
+    for (int a = 0; a < MAX_AMB; a++) {
+        Responder *r = &ambs[a];
+        if (!r->active) continue;
+        int pd = r->pedTarget;
+        switch (r->mode) {
+        case 0:                                                    // driving to the patient
+            if (pd < 0 || !peds[pd].active || !peds[pd].ill) { r->active = false; break; }
+            if (MoveResponder(r, dt, 3.6f)) { respSum += (float)simTime - peds[pd].illSince; respN++; r->mode = 1; r->work = 0.0f; }
+            break;
+        case 1:                                                    // paramedics load the patient
+            r->work += dt;
+            if (r->work > 2.2f) {
+                if (peds[pd].active && peds[pd].ill) { r->lostT = peds[pd].illSince; peds[pd].active = false; }
+                int cx = r->path[r->len - 1] % MAP_W, cy = r->path[r->len - 1] / MAP_W;
+                int len = FindPath(cx, cy, hospStn[0].rx, hospStn[0].ry, 0, r->path);
+                if (len <= 0) { r->active = false; break; }
+                r->len = len; r->idx = 0; r->t = 0.0f; r->arrived = (len == 1); r->mode = 2; r->work = 0.0f;
+            }
+            break;
+        case 2:                                                    // blue-light run to the hospital
+            if (MoveResponder(r, dt, 3.6f)) { r->mode = 3; r->work = 0.0f; }
+            break;
+        case 3:
+            r->work += dt;
+            if (r->work > 1.6f) { medSaved++; transSum += (float)simTime - r->lostT; transN++; r->active = false; }
+            break;
+        }
+    }
+}
+
+static void UpdateMedical(float dt) {
+    medTimer -= dt;
+    if (medTimer <= 0.0f) {                                        // somebody collapses
+        medTimer = 13.0f + Rf() * 16.0f;
+        for (int tries = 0; tries < 40; tries++) {
+            int i = GetRandomValue(0, MAX_PEDS - 1);
+            Ped *p = &peds[i];
+            if (!p->active || p->ill || p->criminal || p->robbing) continue;
+            int tx = (int)p->x, ty = (int)p->y;
+            if (!InBounds(tx, ty) || !pedNode[ty][tx] || (p->wn > 0 && p->crossing)) continue;
+            p->ill = true; p->illCalled = false; p->illT = 0.0f; p->illSince = (float)simTime; medCalls++;
+            break;
+        }
+    }
+    for (int i = 0; i < MAX_PEDS; i++) {                           // smoke inhalation near a blaze
+        Ped *p = &peds[i];
+        if (!p->active || p->ill || p->robbing) continue;
+        int tx = (int)p->x, ty = (int)p->y;
+        bool nearFire = false;
+        for (int dy = -1; dy <= 1 && !nearFire; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+                if (InBounds(tx + dx, ty + dy) && fireI[ty + dy][tx + dx] > 40.0f) { nearFire = true; break; }
+        if (nearFire && pedNode[ty][tx] && !(p->wn > 0 && p->crossing) && Rf() < 0.35f * dt) {
+            p->ill = true; p->illCalled = false; p->illT = 0.0f; p->illSince = (float)simTime; medCalls++;
+        }
+    }
+    for (int i = 0; i < MAX_PEDS; i++) {                           // raise the alarm
+        Ped *p = &peds[i];
+        if (!p->active || !p->ill || p->illCalled) continue;
+        bool ok = smartCity ? LaunchDrone(D_MEDIC, p->x, p->y, i, -1)
+                            : Dispatch(ambs, MAX_AMB, hospStn, nHosp, (int)p->x, (int)p->y, i, 1, 0, 0);
+        if (ok) p->illCalled = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Traffic signals: fixed 24 s cycle in the normal city; in the smart city the road monitors
+// count the cars approaching each junction and the lights respond (gap-out / extension).
+// ---------------------------------------------------------------------------
+static int ApproachCount(int jx, int jy, int axis) {
+    int n = 0;
+    for (int i = 0; i < MAX_CARS; i++) {
+        const Car *c = &cars[i];
+        if (!c->active || c->arcing || (c->dir < 2 ? 0 : 1) != axis) continue;
+        float dx = c->x - (jx + 0.5f), dy = c->y - (jy + 0.5f);
+        float dist, side;
+        if (axis == 0) { dist = -dy * DY[c->dir]; side = fabsf(dx); }
+        else           { dist = -dx * DX[c->dir]; side = fabsf(dy); }
+        if (side < 0.6f && dist > 0.15f && dist < 3.5f) n++;
+    }
+    return n;
+}
+
+static void UpdateSignals(float dt) {
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) {
+            if (ctrl[y][x] != C_SIGNAL) continue;
+            int ph = sigPhase[y][x];
+            sigT[y][x] += dt;
+            float t = sigT[y][x];
+            bool next = false;
+            if (ph == 1 || ph == 4) next = (t >= 2.0f);
+            else if (ph == 2 || ph == 5) next = (t >= 1.0f);
+            else if (!smartCity) next = (t >= 9.0f);
+            else {
+                int axis = (ph == 0) ? 0 : 1;
+                int nSame = ApproachCount(x, y, axis), nOpp = ApproachCount(x, y, 1 - axis);
+                if (t >= 16.0f) next = true;
+                else if (t >= 5.0f && nSame == 0 && nOpp > 0) next = true;
+                else if (t >= 9.0f && (nSame == 0 || nOpp >= nSame)) next = true;
+            }
+            if (next) { sigPhase[y][x] = (unsigned char)((ph + 1) % 6); sigT[y][x] = 0.0f; }
+        }
 }
 
 // ---------------------------------------------------------------------------
@@ -1713,15 +2196,19 @@ static void UpdateMaps(void) {
                 case T_BUILDING:
                     heatT = (bType[y][x] == B_IND ? 4.5f : 2.2f) * df + 0.8f;
                     pol = (bType[y][x] == B_IND) ? (deco[y][x] == 0 ? 7.0f : 4.0f) : (bType[y][x] == B_COM ? 0.9f : 0.5f);
+                    if (smartCity) {
+                        if (bType[y][x] == B_IND) pol = (deco[y][x] == 0) ? 1.5f : 3.0f;      // factory smoke traps
+                        else if (bType[y][x] == B_COM && bHeight[y][x] >= 1.0f) { pol = -2.4f; heatT -= 1.0f; }   // skyrise living walls
+                    }
                     break;
                 case T_HOUSE: heatT = 1.4f * df + 0.4f; pol = 0.3f; break;
                 case T_MALL:  heatT = 3.0f * df + 0.8f; pol = 1.2f; break;
                 case T_PARK:  heatT = 1.6f; pol = 0.5f; break;
-                case T_LANDFILL: heatT = 1.2f; pol = 3.5f + landfillFill * 0.03f; break;
+                case T_LANDFILL: heatT = 1.2f; pol = IsRecycleTile(x, y) ? 1.0f : 3.5f + landfillFill * 0.03f; break;
                 case T_ROAD:  heatT = 1.2f + traffic[y][x] * 2.0f; pol = 0.4f + traffic[y][x] * 4.0f; break;
                 case T_TREE:  heatT = -1.8f; pol = -0.6f; break;
                 case T_GRASS: heatT = (deco[y][x] ? -0.9f : -0.4f); pol = (deco[y][x] ? -0.3f : -0.15f); break;
-                case T_POWER: heatT = 7.0f * st.powerLoad; pol = 9.0f * st.powerLoad; break;
+                case T_POWER: if (smartCity) { heatT = 1.5f; pol = 0.2f; } else { heatT = 7.0f * st.powerLoad; pol = 9.0f * st.powerLoad; } break;
                 case T_RUIN:  heatT = 0.5f; break;
                 default:      heatT = 1.0f; pol = 0.3f; break;
             }
@@ -1739,7 +2226,8 @@ static void UpdateStats(void) {
     static const float eBase[3] = { 40.0f, 95.0f, 230.0f };    // kW per building type
     static const float wBase[3] = { 30.0f, 55.0f, 140.0f };    // L/min per building type
     int res = 0, houses = 0, bld = 0, dmg = 0, roads = 0, green = 0, plants = 0, works = 0, stations = 0, lit = 0;
-    float eDem = 0.0f, wDem = 0.0f, df = DayFactor();
+    float eDem = 0.0f, wDem = 0.0f, df = DayFactor(), roofKW = 0.0f;
+    int roofs = 0;
 
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) {
@@ -1752,23 +2240,34 @@ static void UpdateStats(void) {
                     if (health[y][x] < 60.0f) dmg++;
                     eDem += eBase[t] * df;
                     wDem += wBase[t] * df;
+                    if (!(t == B_IND && deco[y][x] == 2)) {
+                        roofKW += (t == B_IND) ? (deco[y][x] == 0 ? 30.0f : 45.0f) : (t == B_COM ? 24.0f : 18.0f); roofs++;
+                    }
                 } break;
                 case T_HOUSE:
                     bld++; houses++;
                     if (health[y][x] < 60.0f) dmg++;
                     eDem += 18.0f * df; wDem += 14.0f * df;
+                    roofKW += 5.5f; roofs++;
                     break;
                 case T_MALL:
                     bld++;
                     if (health[y][x] < 60.0f) dmg++;
                     eDem += 160.0f * (0.5f + 0.5f * ShopFactor()); wDem += 80.0f * ShopFactor();
+                    roofKW += 40.0f; roofs++;
+                    break;
+                case T_HOSPITAL:
+                    bld++;
+                    if (health[y][x] < 60.0f) dmg++;
+                    eDem += 150.0f * (0.7f + 0.3f * df); wDem += 90.0f * df;
+                    roofKW += 45.0f; roofs++;
                     break;
                 case T_PARK: lit++; break;
                 case T_LANDFILL: wDem += 6.0f; break;
                 case T_TREE: case T_GRASS: green++; break;
                 case T_POWER: plants++; break;
-                case T_WATER: works++; break;
-                case T_FIRE_STN: case T_POLICE_STN: stations++; break;
+                case T_WATER: works++; roofKW += 20.0f; roofs++; break;
+                case T_FIRE_STN: case T_POLICE_STN: stations++; roofKW += 12.0f; roofs++; break;
                 default: break;
             }
         }
@@ -1781,6 +2280,28 @@ static void UpdateStats(void) {
     st.energyDemand = eDem; st.energyCap = plants * PLANT_KW;
     st.energyPct = (st.energyCap > 0.0f) ? eDem / st.energyCap * 100.0f : 999.0f;
     st.powerLoad = (st.energyCap > 0.0f) ? Clamp(eDem / st.energyCap, 0.0f, 1.0f) : 0.0f;
+    if (smartCity) {
+        // power plants are decommissioned: roofs + solar farm + wind farm, with a battery bank as buffer
+        float sun = SunK();
+        solarRoofs = roofs;
+        roofSolarKW = roofKW * sun;
+        farmSolarKW = (FARM_SOLAR_X1 - FARM_SOLAR_X0 + 1) * (FARM_SOLAR_Y1 - FARM_SOLAR_Y0 + 1) * SOLAR_TILE_KW * sun;
+        windKW = N_TURB * TURB_KW * WindFactor();
+        float supply = roofSolarKW + farmSolarKW + windKW;
+        gridImportKW = 0.0f;
+        if (supply >= eDem) batteryPct = fminf(100.0f, batteryPct + (supply - eDem) * 0.5f / BATT_KWS * 100.0f);
+        else {
+            float need = eDem - supply;
+            if (batteryPct > 0.5f) batteryPct = fmaxf(0.0f, batteryPct - need * 0.5f / BATT_KWS * 100.0f);
+            else gridImportKW = need;                               // battery flat: small backup grid tie
+        }
+        st.energyCap = supply;
+        st.energyPct = eDem / (supply + (batteryPct > 3.0f ? 4000.0f : 0.0f) + 1.0f) * 100.0f;
+        st.powerLoad = 0.0f;
+        renewPct = (eDem > 1.0f) ? 100.0f * (1.0f - gridImportKW / eDem) : 100.0f;
+    } else {
+        gridImportKW = eDem; renewPct = 0.0f;                       // everything is burned at the power plant
+    }
     st.waterDemand = wDem; st.waterCap = works * WORKS_LPM;
     st.waterPct = (st.waterCap > 0.0f) ? wDem / st.waterCap * 100.0f : 999.0f;
     st.sewerLoad = wDem * 0.85f + rain * roads * 35.0f;     // waste water + storm run-off
@@ -1798,7 +2319,13 @@ static void UpdateStats(void) {
     st.population = res * 22 + houses * 6 + births - deaths;
     if (st.population < 0) st.population = 0;
 
-    landfillFill = fminf(100.0f, landfillFill + st.population * 0.000012f * 0.5f);   // waste from the population
+    {   // household + industrial waste; the smart city's recycling plant diverts most of it from the landfill
+        float tonnes = st.population * 0.0006f;
+        float toLandfill = smartCity ? tonnes * 0.36f : tonnes;
+        if (smartCity) recycledT += tonnes * 0.64f;
+        wasteT += toLandfill;
+        landfillFill = fminf(100.0f, landfillFill + toLandfill * 0.01f);
+    }
 
     int pending = 0;
     for (int i = 0; i < MAX_CARS; i++) if (cars[i].active && cars[i].wanted) pending++;
@@ -1813,9 +2340,14 @@ static void UpdateSim(float dt) {
     simTime += dt;
     UpdateClock();
     UpdateWeather(dt);
+    UpdateSignals(dt);
     UpdatePeds(dt);          // first, so cars can see who is on a crossing
     UpdateCars(dt);
     UpdateResponders(dt);
+    UpdateAmbulances(dt);
+    UpdateDrones(dt);
+    UpdateMedical(dt);
+    UpdateWind(dt);
     UpdateFire(dt);
     EmitChimneys(dt);
     UpdateParticles(dt);
@@ -1885,6 +2417,157 @@ static void DrawNetwork2D(float off, Color col, Color dot, float flowSpeed) {
             }
         }
 }
+// ---------------------------------------------------------------------------
+// 2D drawing - smart city additions
+// ---------------------------------------------------------------------------
+static void DrawSolar2D(float x, float y, float w, float h, float a) {
+    Color line = Fade((Color){ 125, 155, 205, 255 }, a);
+    DrawRectangleRec((Rectangle){ x, y, w, h }, Fade((Color){ 26, 52, 122, 255 }, a));
+    int nc = (int)(w / 4.0f); if (nc < 1) nc = 1;
+    for (int i = 1; i < nc; i++) DrawLineV((Vector2){ x + i * w / nc, y }, (Vector2){ x + i * w / nc, y + h }, line);
+    DrawLineV((Vector2){ x, y + h * 0.5f }, (Vector2){ x + w, y + h * 0.5f }, line);
+    DrawRectangleLinesEx((Rectangle){ x, y, w, h }, 1.0f, Fade((Color){ 170, 190, 220, 255 }, a));
+}
+
+static void DrawLivingWall2D(int px, int py, float a) {
+    Color g = Fade((Color){ 70, 185, 80, 255 }, a), lg = Fade((Color){ 150, 230, 110, 255 }, a);
+    DrawRectangleLinesEx((Rectangle){ px + 4.0f, py + 4.0f, TILE - 8.0f, TILE - 8.0f }, 3.0f, g);
+    for (int k = 0; k < 5; k++) {
+        float o = 6.0f + k * 6.0f;
+        DrawCircle((int)(px + o), py + 4, 2.4f, lg); DrawCircle((int)(px + o), py + TILE - 4, 2.4f, lg);
+        DrawCircle(px + 4, (int)(py + o), 2.4f, lg); DrawCircle(px + TILE - 4, (int)(py + o), 2.4f, lg);
+    }
+    DrawRectangle(px + TILE / 2 - 4, py + TILE / 2 - 4, 8, 8, Fade((Color){ 60, 160, 70, 255 }, a));       // rooftop garden
+}
+
+static void DrawHospital2D(int px, int py, float a) {
+    DrawRectangle(px + 3, py + 3, TILE - 6, TILE - 6, Fade((Color){ 240, 243, 247, 255 }, a));
+    DrawRectangleLines(px + 3, py + 3, TILE - 6, TILE - 6, Fade((Color){ 150, 158, 170, 255 }, a));
+    DrawRectangle(px + TILE / 2 - 3, py + 8, 6, 18, Fade((Color){ 215, 35, 40, 255 }, a));
+    DrawRectangle(px + TILE / 2 - 9, py + 14, 18, 6, Fade((Color){ 215, 35, 40, 255 }, a));
+    if (smartCity) DrawSolar2D(px + 5, py + TILE - 10, 14, 5, a);
+}
+
+static void DrawBattery2D(int px, int py, float a) {
+    DrawRectangle(px + 3, py + 3, TILE - 6, TILE - 6, Fade((Color){ 58, 74, 66, 255 }, a));
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < 2; k++) {
+            DrawRectangle(px + 6 + i * 14, py + 6 + k * 11, 12, 8, Fade((Color){ 205, 232, 215, 255 }, a));
+            DrawRectangle(px + 8 + i * 14, py + 9 + k * 11, 8, 2, Fade((Color){ 60, 215, 120, 255 }, a));
+        }
+    float f = Clamp(batteryPct / 100.0f, 0.0f, 1.0f);
+    DrawRectangle(px + 6, py + TILE - 10, TILE - 12, 4, Fade((Color){ 30, 34, 40, 255 }, a));
+    DrawRectangle(px + 6, py + TILE - 10, (int)((TILE - 12) * f), 4, Fade(f > 0.5f ? (Color){ 70, 230, 120, 255 } : (f > 0.2f ? (Color){ 250, 205, 50, 255 } : (Color){ 240, 70, 60, 255 }), a));
+}
+
+static void DrawRecycle2D(int x, int y, float a) {
+    int px = x * TILE, py = y * TILE;
+    unsigned char v = vr[y][x];
+    static const Color bale[5] = { {70,110,190,255}, {190,195,202,255}, {205,170,110,255}, {85,160,95,255}, {225,225,120,255} };
+    if (x == 20 && y == 11) {
+        DrawRectangle(px + 2, py + 3, TILE - 4, TILE - 6, Fade((Color){ 70, 150, 115, 255 }, a));
+        for (int k = 0; k < 3; k++) DrawRectangle(px + 4 + k * 10, py + 5, 8, TILE - 10, Fade((Color){ 90, 175, 135, 255 }, a));
+        DrawCircle(px + TILE / 2, py + TILE / 2, 9.0f, Fade((Color){ 35, 150, 85, 255 }, a));
+        for (int k = 0; k < 3; k++) {
+            float ang = (k * 120.0f + 90.0f) * DEG2RAD;
+            Vector2 c = { px + TILE / 2 + 5.0f * cosf(ang), py + TILE / 2 - 5.0f * sinf(ang) };
+            DrawPoly(c, 3, 3.2f, (float)(k * 120) + 30.0f, Fade(WHITE, a));
+        }
+    } else if (x == 20) {
+        DrawRectangle(px + 2, py + 4, TILE - 4, TILE - 8, Fade((Color){ 160, 205, 185, 255 }, a));
+        DrawRectangle(px + 14, py, 6, TILE, Fade((Color){ 55, 58, 64, 255 }, a));
+        float t = (float)GetTime();
+        for (int i = 0; i < 5; i++) DrawRectangle(px + 15, py + (int)(fmodf(t * 12.0f + i * 7.0f, (float)TILE)), 4, 3, Fade(bale[(v + i) % 5], a));
+        for (int i = 0; i < 3; i++) DrawRectangle(px + 24, py + 4 + i * 10, 8, 7, Fade(bale[(v + i) % 5], a));
+    } else {
+        for (int i = 0; i < 4; i++) {
+            DrawRectangle(px + 4 + (i % 2) * 16, py + 5 + (i / 2) * 15, 13, 11, Fade(bale[(v + i) % 5], a));
+            DrawRectangleLines(px + 4 + (i % 2) * 16, py + 5 + (i / 2) * 15, 13, 11, Fade((Color){ 40, 50, 55, 255 }, a));
+        }
+    }
+}
+
+static void DrawMonitor2D(int x, int y) {
+    bool horiz = (RoadLine(x, y) == 1);
+    float cx = x * TILE + (horiz ? TILE * 0.55f : TILE - 3.0f), cy = y * TILE + (horiz ? TILE - 3.0f : TILE * 0.55f);
+    Color c = CongColor(traffic[y][x], 1.0f);
+    DrawCircleV((Vector2){ cx, cy }, 5.2f, (Color){ 20, 26, 34, 255 });
+    DrawCircleV((Vector2){ cx, cy }, 3.6f, c);
+    DrawCircleV((Vector2){ cx, cy }, 1.4f, (Color){ 140, 230, 255, 255 });
+}
+
+static void DrawAmbulance2D(const Responder *r, double t) {
+    float px = r->x * TILE, py = r->y * TILE;
+    DrawRectanglePro((Rectangle){ px, py, 17, 9 }, (Vector2){ 8.5f, 4.5f }, r->angle, (Color){ 248, 248, 250, 255 });
+    DrawRectanglePro((Rectangle){ px, py, 17, 2.5f }, (Vector2){ 8.5f, 1.25f }, r->angle, (Color){ 40, 165, 90, 255 });
+    bool flash = ((int)(t * 6.0)) % 2 == 0;
+    DrawRectangle((int)px - 1, (int)py - 3, 2, 6, (Color){ 215, 35, 40, 255 });
+    DrawRectangle((int)px - 3, (int)py - 1, 6, 2, (Color){ 215, 35, 40, 255 });
+    DrawCircle((int)px, (int)py - 5, 1.8f, flash ? (Color){ 255, 60, 60, 255 } : (Color){ 70, 130, 255, 255 });
+}
+
+static void DrawDrone2D(const Drone *d, double t) {
+    float px = d->x * TILE, py = d->y * TILE, lift = d->z * 5.0f;
+    DrawCircleV((Vector2){ px + 1.5f, py + 2.0f }, 5.0f, Fade(BLACK, 0.28f));                      // shadow on the ground
+    Vector2 c = { px, py - lift };
+    Color body = (d->kind == D_FIRE) ? (Color){ 220, 65, 55, 255 } : (d->kind == D_POLICE ? (Color){ 245, 247, 250, 255 } : (Color){ 250, 250, 250, 255 });
+    if (d->spraying) {
+        Vector2 b = { d->sx * TILE, d->sy * TILE };
+        if (d->kind == D_FIRE) DrawLineEx(c, b, 2.5f, (Color){ 130, 200, 255, 200 });
+        else if (d->kind == D_POLICE) DrawLineEx(c, b, 1.6f, (Color){ 255, 250, 190, 150 });
+    }
+    float sp = (float)t * 30.0f;
+    for (int k = 0; k < 4; k++) {
+        float a = k * 90.0f * DEG2RAD + 0.785f;
+        Vector2 r = { c.x + 6.0f * cosf(a), c.y + 6.0f * sinf(a) };
+        DrawLineV(c, r, (Color){ 50, 52, 58, 255 });
+        DrawCircleV(r, 3.6f, Fade(WHITE, 0.30f));
+        DrawLineV((Vector2){ r.x + 3.6f * cosf(sp + k), r.y + 3.6f * sinf(sp + k) }, (Vector2){ r.x - 3.6f * cosf(sp + k), r.y - 3.6f * sinf(sp + k) }, (Color){ 30, 30, 34, 255 });
+    }
+    DrawCircleV(c, 3.4f, body);
+    DrawCircleLines((int)c.x, (int)c.y, 3.4f, (Color){ 40, 44, 52, 255 });
+    bool flash = ((int)(t * 6.0)) & 1;
+    if (d->kind == D_POLICE) DrawCircleV(c, 1.4f, flash ? RED : SKYBLUE);
+    else if (d->kind == D_MEDIC) { DrawRectangle((int)c.x - 1, (int)c.y - 2, 2, 5, (Color){ 215, 35, 40, 255 }); DrawRectangle((int)c.x - 2, (int)c.y - 1, 5, 2, (Color){ 215, 35, 40, 255 }); }
+    if (d->carrying) DrawRectangleRec((Rectangle){ c.x - 3, c.y + 4, 6, 4 }, WHITE);
+}
+
+// the renewable-energy strip to the east of the city (world pixels, drawn with a zoomed-out camera)
+static void DrawFarm2D(void) {
+    float t = (float)GetTime();
+    int x0 = MAP_W * TILE, w = FARM_W * TILE;
+    DrawRectangle(x0, 0, w, MAP_H * TILE, (Color){ 118, 164, 86, 255 });
+    for (int y = 0; y < MAP_H; y++) if (y != FARM_ROAD_Y && (y & 1)) DrawRectangle(x0, y * TILE, w, TILE, Fade((Color){ 95, 140, 70, 255 }, 0.35f));
+    // access road
+    DrawRectangle(x0, FARM_ROAD_Y * TILE, w, TILE, COL_ROAD);
+    DrawRectangle(x0 + TILE / 4, FARM_ROAD_Y * TILE + TILE / 2 - 1, w - TILE / 2, LINE_THICK, COL_LINE);
+    // solar field
+    for (int y = FARM_SOLAR_Y0; y <= FARM_SOLAR_Y1; y++)
+        for (int x = FARM_SOLAR_X0; x <= FARM_SOLAR_X1; x++)
+            for (int i = 0; i < 2; i++)
+                for (int k = 0; k < 2; k++)
+                    DrawSolar2D(x * TILE + 2 + i * 17, y * TILE + 3 + k * 17, 15, 12, 1.0f);
+    // grid hub (battery containers + transformer)
+    DrawRectangle(24 * TILE + 3, 11 * TILE + 3, TILE - 6, 3 * TILE - 6, (Color){ 120, 126, 132, 255 });
+    for (int k = 0; k < 3; k++) {
+        DrawRectangle(24 * TILE + 6, (11 + k) * TILE + 6, TILE - 12, TILE - 12, (Color){ 205, 232, 215, 255 });
+        for (int s = 0; s < 4; s++) DrawRectangle(24 * TILE + 9 + s * 5, (11 + k) * TILE + 14, 3, 8, (Color){ 60, 215, 120, 255 });
+    }
+    // wind turbines: three rotating blades
+    for (int i = 0; i < N_TURB; i++) {
+        Vector2 c = { TURB_POS[i][0] * TILE, TURB_POS[i][1] * TILE };
+        DrawCircleV((Vector2){ c.x + 3, c.y + 3 }, 4.0f, Fade(BLACK, 0.25f));
+        float ang = t * (0.5f + 5.0f * WindFactor()) + i;
+        for (int b = 0; b < 3; b++) {
+            float a = ang + b * 2.094f;
+            DrawLineEx(c, (Vector2){ c.x + 16.0f * cosf(a), c.y + 16.0f * sinf(a) }, 2.2f, (Color){ 245, 247, 250, 255 });
+        }
+        DrawCircleV(c, 3.2f, (Color){ 210, 215, 222, 255 });
+    }
+    DrawRectangleLinesEx((Rectangle){ (float)x0, 0.0f, (float)w, (float)(MAP_H * TILE) }, 2.0f, (Color){ 235, 235, 240, 255 });
+    DrawText("RENEWABLE FARM", x0 + 8, MAP_H * TILE - 14, 10, (Color){ 20, 50, 20, 255 });
+    DrawText("solar + wind", x0 + 8, (FARM_SOLAR_Y1 + 1) * TILE + 6, 10, (Color){ 20, 50, 20, 255 });
+}
 
 // ---------------------------------------------------------------------------
 // 2D drawing
@@ -1944,7 +2627,7 @@ static void DrawGround2D(int x, int y, bool xray) {
         Color base = xray ? COL_SOIL : COL_GRASS;
         int s = surface[y][x];
         if (s == T_PARK) base = xray ? COL_ROAD_DIM : (Color){ 88, 88, 94, 255 };
-        else if (s == T_LANDFILL) base = (Color){ 112, 94, 72, 255 };
+        else if (s == T_LANDFILL) base = IsRecycleTile(x, y) ? (Color){ 150, 150, 152, 255 } : (Color){ 112, 94, 72, 255 };
         else if (paved[y][x]) base = xray ? COL_ROAD_DIM : (Color){ 150, 150, 152, 255 };
         else if (s == T_HOUSE) base = xray ? COL_SOIL : (Color){ 92, 168, 76, 255 };
         DrawRectangle(px, py, TILE, TILE, base);
@@ -2055,7 +2738,13 @@ static void DrawStructure2D(int x, int y) {
                 } else {                                      // factory with chimney
                     DrawRectangle(px + 5, py + 8, TILE - 10, TILE - 13, Fade(ic, gAlpha));
                     DrawRectangle(px + TILE - 13, py + 2, 5, 11, Fade((Color){ 55, 55, 55, 255 }, gAlpha));
+                    if (smartCity) {                              // smoke trap: scrubber beside the stack, green "clean" cap
+                        DrawRectangle(px + TILE - 22, py + 5, 7, 10, Fade((Color){ 70, 150, 150, 255 }, gAlpha));
+                        DrawRectangle(px + TILE - 13, py + 1, 5, 3, Fade((Color){ 80, 215, 130, 255 }, gAlpha));
+                        DrawSolar2D((float)(px + 7), (float)(py + 20), 14.0f, 7.0f, gAlpha);
+                    }
                 }
+                if (smartCity && deco[y][x] == 1) DrawSolar2D((float)(px + 7), (float)(py + 9), 22.0f, 8.0f, gAlpha);
                 break;
             }
             DrawRectangle(px + 5, py + 5, TILE - 10, TILE - 10, Fade(c, gAlpha));
@@ -2064,6 +2753,10 @@ static void DrawStructure2D(int x, int y) {
             for (int wy = 0; wy < 2; wy++)
                 for (int wx = 0; wx < 2; wx++)
                     DrawRectangle(px + 9 + wx * 10, py + 9 + wy * 10, 5, 5, Fade(wc, gAlpha));
+            if (smartCity) {
+                if (bType[y][x] == B_COM && bHeight[y][x] >= 1.0f) DrawLivingWall2D(px, py, gAlpha);
+                else { DrawSolar2D((float)(px + 7), (float)(py + 7), 10.0f, 9.0f, gAlpha); DrawSolar2D((float)(px + 19), (float)(py + 7), 10.0f, 9.0f, gAlpha); }
+            }
         } break;
         case T_HOUSE: {
             unsigned char v = vr[y][x];
@@ -2078,15 +2771,18 @@ static void DrawStructure2D(int x, int y) {
             if (f == 0) { gy = py + 2; } else if (f == 1) { gy = py + TILE - 8; }
             DrawRectangle(gx, gy, 10, 6, Fade((Color){ 180, 180, 184, 255 }, gAlpha));
             if (drive[y][x]) DrawRectangle(gx + 2, gy + 1, 6, 4, Fade(CAR_COLS[drvCol[y][x]], gAlpha));
+            if (smartCity) DrawSolar2D((float)(px + 9), (float)(py + 9), 7.0f, 12.0f, gAlpha);
         } break;
         case T_MALL: {
             DrawRectangle(px, py, TILE, TILE, Fade((Color){ 206, 198, 180, 255 }, gAlpha));
             DrawRectangle(px + 3, py + 3, TILE - 6, TILE - 6, Fade((Color){ 190, 182, 164, 255 }, gAlpha));
             if (y == 5) DrawRectangle(px + 4, py + TILE - 6, TILE - 8, 3, Fade((Color){ 70, 120, 170, 255 }, gAlpha));
             if (x == 20 && y == 4) DrawText("MALL", px + 4, py + 6, 10, Fade((Color){ 190, 40, 40, 255 }, gAlpha));
+            if (smartCity) { DrawSolar2D((float)(px + 5), (float)(py + TILE - 17), 12.0f, 9.0f, gAlpha); DrawSolar2D((float)(px + 19), (float)(py + TILE - 17), 12.0f, 9.0f, gAlpha); }
         } break;
         case T_PARK: DrawParkedCars2D(x, y); break;
         case T_LANDFILL: {
+            if (IsRecycleTile(x, y) && !gateTile[y][x]) { DrawRecycle2D(x, y, gAlpha); break; }
             unsigned char v = vr[y][x];
             for (int k = 0; k < 3; k++) {
                 float cx = px + 8 + ((v >> (k * 2)) & 3) * 7, cy = py + 9 + ((v >> (k + 2)) & 3) * 7;
@@ -2101,12 +2797,16 @@ static void DrawStructure2D(int x, int y) {
         case T_FIRE_STN:
             DrawRectangle(px + 3, py + 3, TILE - 6, TILE - 6, Fade(COL_FIRE_STN, gAlpha));
             DrawText("FIRE", px + 6, py + TILE / 2 - 4, 10, Fade(RAYWHITE, gAlpha));
+            if (smartCity) { DrawSolar2D((float)(px + 6), (float)(py + TILE - 13), 18.0f, 7.0f, gAlpha); DrawCircle(px + TILE - 9, py + 9, 5.0f, Fade((Color){ 250, 205, 40, 255 }, gAlpha)); DrawCircle(px + TILE - 9, py + 9, 3.5f, Fade((Color){ 52, 56, 64, 255 }, gAlpha)); }
             break;
         case T_POLICE_STN:
             DrawRectangle(px + 3, py + 3, TILE - 6, TILE - 6, Fade(COL_POLICE_STN, gAlpha));
             DrawText("POL", px + 8, py + TILE / 2 - 4, 10, Fade(RAYWHITE, gAlpha));
+            if (smartCity) { DrawSolar2D((float)(px + 6), (float)(py + TILE - 13), 18.0f, 7.0f, gAlpha); DrawCircle(px + TILE - 9, py + 9, 5.0f, Fade((Color){ 250, 205, 40, 255 }, gAlpha)); DrawCircle(px + TILE - 9, py + 9, 3.5f, Fade((Color){ 52, 56, 64, 255 }, gAlpha)); }
             break;
+        case T_HOSPITAL: DrawHospital2D(px, py, gAlpha); break;
         case T_POWER:
+            if (smartCity) { DrawBattery2D(px, py, gAlpha); break; }
             DrawRectangle(px + 3, py + 3, TILE - 6, TILE - 6, Fade(COL_POWER, gAlpha));
             DrawRectangle(px + 7, py + 5, 5, 9, Fade((Color){ 30, 30, 34, 255 }, gAlpha));
             DrawRectangle(px + 20, py + 5, 5, 9, Fade((Color){ 30, 30, 34, 255 }, gAlpha));
@@ -2116,6 +2816,7 @@ static void DrawStructure2D(int x, int y) {
             DrawRectangle(px + 3, py + 3, TILE - 6, TILE - 6, Fade(COL_WORKS, gAlpha));
             DrawCircle(px + TILE / 2, py + 12, 7, Fade((Color){ 200, 230, 240, 255 }, gAlpha));
             DrawText("H2O", px + 7, py + TILE - 15, 10, Fade(RAYWHITE, gAlpha));
+            if (smartCity) DrawSolar2D((float)(px + TILE - 17), (float)(py + 6), 12.0f, 8.0f, gAlpha);
             break;
         default: break;
     }
@@ -2181,7 +2882,7 @@ static void DrawScene2D(void) {
     bool xray = layerOn[L_WATER] || layerOn[L_SEWER];
     double t = GetTime();
 
-    ClearBackground(COL_GRASS);
+    if (smartCity) DrawFarm2D();
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) DrawGround2D(x, y, xray);
 
@@ -2223,10 +2924,18 @@ static void DrawScene2D(void) {
         DrawCircleV(p, 2.4f, peds[i].shirt);
         DrawCircleV((Vector2){ p.x, p.y - 2.2f }, 1.5f, COL_CIVILIAN);
         if (peds[i].robbing) DrawCircleLines((int)p.x, (int)p.y, 7.0f + 2.0f * sinf((float)t * 10.0f), RED);
+        if (peds[i].ill) {
+            DrawCircleLines((int)p.x, (int)p.y, 6.0f + 2.0f * sinf((float)t * 8.0f), (Color){ 255, 70, 70, 255 });
+            DrawRectangle((int)p.x - 1, (int)p.y - 9, 2, 6, WHITE); DrawRectangle((int)p.x - 3, (int)p.y - 7, 6, 2, WHITE);
+        }
     }
     for (int i = 0; i < MAX_TRUCKS; i++) if (trucks[i].active) DrawResponder2D(&trucks[i], COL_TRUCK, t);
     for (int i = 0; i < MAX_POLICE; i++) if (police[i].active) DrawResponder2D(&police[i], COL_POLICE_CAR, t);
+    for (int i = 0; i < MAX_AMB; i++) if (ambs[i].active) DrawAmbulance2D(&ambs[i], t);
+    if (smartCity)
+        for (int y = 0; y < MAP_H; y++) for (int x = 0; x < MAP_W; x++) if (monitorTile[y][x]) DrawMonitor2D(x, y);
     DrawParticles2D();
+    for (int i = 0; i < MAX_DRONES; i++) if (drones[i].active) DrawDrone2D(&drones[i], t);
 
     if (hoverOK) DrawRectangleLines(hoverX * TILE, hoverY * TILE, TILE, TILE, WHITE);
 }
@@ -2237,6 +2946,19 @@ static void DrawScene2D(void) {
 static bool NightNow(void) { return st.daylight < 0.45f; }
 static Color A(Color c) { return Fade(c, gAlpha); }
 static const Color GLASS = { 45, 58, 76, 255 };
+
+// smart-city models (defined in p9d_smart3d.c)
+static void SolarPanel(float x, float y, float z, float w, float d, float tilt);
+static void FlatSolar(float cx, float cz, float y, int nx, int nz, float gx, float gz, float pw, float pd, float tilt);
+static void GableSolar(bool alongZ, float a, float y0, float h, float s0, float s1, float L);
+static void HouseSolar3D(int rtype);
+static void LivingWall(float y0, int floors, float w, int startF);
+static void RooftopGarden3D(float h);
+static void SmokeTrap3D(float h);
+static void DrawStationSmart3D(bool fire, int sx, int sy);
+static void DrawHospital3D(int x, int y);
+static void DrawBattery3D(int x, int y);
+static void DrawRecycle3D(int x, int y);
 
 static void Wheels(float W, float L, int pairs) {
     Color tyre = { 22, 22, 24, 255 };
@@ -2443,6 +3165,7 @@ static void DrawHouse3D(int x, int y) {
     else if (rtype == 2) RoofHip(0.40f, 0.38f, 0.20f, 0.12f, roof);
     else { BoxC(-0.05f, 0.215f, -0.08f, 0.38f, 0.03f, 0.36f, Shade(roof, 0.8f)); }
     if (rtype != 3) { rlPushMatrix(); rlTranslatef(-0.05f, 0, -0.08f); rlPopMatrix(); }
+    if (smartCity && !dmg) HouseSolar3D(rtype);
     if (v & 1) BoxT(TX_BRICK, -0.16f, 0.30f, -0.15f, 0.05f, 0.12f, 0.05f, A(WHITE));       // chimney
     BoxT(TX_STUCCO, 0.26f, 0.07f, -0.04f, 0.16f, 0.14f, 0.26f, wall);                       // garage
     BoxC(0.26f, 0.148f, -0.04f, 0.18f, 0.02f, 0.28f, Shade(roof, 0.85f));
@@ -2513,11 +3236,23 @@ static void DrawBuilding3D(int x, int y) {
         BoxC(-0.1f, h + 0.18f, -0.1f, 0.012f, 0.28f, 0.012f, A((Color){ 200, 200, 205, 255 }));  // mast
         if (night || (int)(GetTime() * 1.2f) % 2) DrawSphere((Vector3){ -0.1f, h + 0.33f, -0.1f }, 0.016f, A(RED));
         BoxC(0, 0.04f, 0.37f, 0.30f, 0.08f, 0.02f, A((Color){ 40, 50, 60, 255 }));              // lobby doors
+        if (smartCity && !dmg) {                                                                  // smart city: green facades + roof solar
+            LivingWall(0.0f, f1, 0.72f, 3);
+            LivingWall(h1, f2, 0.56f, 1);
+            RooftopGarden3D(h);
+            SolarPanel(-0.20f, h + 0.065f, 0.18f, 0.15f, 0.11f, 12.0f);
+            SolarPanel( 0.20f, h + 0.065f, 0.20f, 0.15f, 0.11f, 12.0f);
+            SolarPanel( 0.00f, h + 0.065f, -0.05f, 0.15f, 0.11f, 12.0f);
+        }
     } else {
         WindowBox(wt, fl, 0, h / 2, 0, 0.74f, h, 0.74f, tint);
         if (bType[y][x] == B_RES && fl <= 4 && (v & 1)) RoofGable(0.78f, 0.78f, h, 0.14f, (v & 2) != 0, A((Color){ 150, 100, 90, 255 }), TX_BRICK, A(WHITE));
         else BoxC(0, h + 0.01f, 0, 0.78f, 0.03f, 0.78f, A((Color){ 112, 114, 120, 255 }));
         BoxC(-0.15f, h + 0.05f, 0.1f, 0.12f, 0.05f, 0.14f, A((Color){ 150, 152, 158, 255 }));
+        if (smartCity && !dmg) {
+            if (bType[y][x] == B_RES && fl <= 4 && (v & 1)) GableSolar((v & 2) != 0, 0.39f, h, 0.14f, 0.08f, 0.34f, 0.30f);
+            else FlatSolar(0.0f, -0.14f, h + 0.045f, 3, 2, 0.24f, 0.20f, 0.20f, 0.14f, 12.0f);
+        }
         if (bType[y][x] == B_COM && fl < 8) {          // shop awning
             Color aw = (v & 1) ? (Color){ 200, 60, 60, 255 } : (Color){ 60, 120, 190, 255 };
             BoxC(0, 0.11f, 0.42f, 0.66f, 0.02f, 0.10f, A(aw));
@@ -2542,6 +3277,12 @@ static void DrawIndustrial3D(int x, int y) {
         DrawCylinder((Vector3){ 0.24f, h + 0.38f, -0.20f }, 0.050f, 0.055f, 0.06f, 12, A((Color){ 200, 50, 45, 255 }));
         BoxC(0.0f, 0.06f, 0.365f, 0.30f, 0.12f, 0.012f, A((Color){ 70, 78, 88, 255 }));
         BoxC(0.0f, 0.12f, 0.372f, 0.34f, 0.01f, 0.012f, A((Color){ 240, 190, 40, 255 }));
+        if (smartCity && !dmg) {
+            SmokeTrap3D(h);
+            SolarPanel(-0.30f, h + 0.035f, 0.22f, 0.20f, 0.18f, 12.0f);
+            SolarPanel(-0.30f, h + 0.035f, -0.22f, 0.20f, 0.18f, 12.0f);
+            SolarPanel( 0.30f, h + 0.035f, 0.26f, 0.20f, 0.18f, 12.0f);
+        }
     } else if (deco[y][x] == 1) {       // warehouse with roller doors
         BoxT(TX_CORRUG, 0, h / 2, 0, 0.90f, h, 0.64f, tint);
         RoofGable(0.94f, 0.68f, h, 0.07f, false, A((Color){ 120, 128, 138, 255 }), TX_CORRUG, tint);
@@ -2549,6 +3290,7 @@ static void DrawIndustrial3D(int x, int y) {
             BoxC(-0.28f + k * 0.28f, 0.09f, 0.322f, 0.20f, 0.18f, 0.008f, A((Color){ 108, 118, 130, 255 }));
             for (int j = 0; j < 4; j++) BoxC(-0.28f + k * 0.28f, 0.03f + j * 0.04f, 0.327f, 0.20f, 0.004f, 0.002f, A((Color){ 85, 92, 102, 255 }));
         }
+        if (smartCity && !dmg) GableSolar(false, 0.47f, h, 0.07f, 0.08f, 0.40f, 0.30f);
     } else {                            // tank farm
         DrawCylinder((Vector3){ -0.22f, 0, -0.05f }, 0.19f, 0.19f, 0.56f, 20, A((Color){ 205, 208, 212, 255 }));
         DrawCylinder((Vector3){ -0.22f, 0.56f, -0.05f }, 0.0f, 0.19f, 0.05f, 20, A((Color){ 170, 174, 180, 255 }));
@@ -2591,6 +3333,7 @@ static void DrawMall3D(int x, int y) {
     if (!n && y > 0) {}
     BoxC(cx - 0.2f, hh + 0.07f, cz + 0.1f, 0.18f, 0.08f, 0.16f, A((Color){ 160, 162, 168, 255 }));       // roof plant
     BoxC(cx + 0.22f, hh + 0.05f, cz - 0.15f, 0.14f, 0.05f, 0.12f, A((Color){ 150, 152, 158, 255 }));
+    if (smartCity && health[y][x] >= 50.0f) FlatSolar(cx, cz, hh + 0.045f, 3, 2, 0.30f, 0.62f, 0.24f, 0.20f, 10.0f);
 }
 
 static void DrawParkingLot3D(int x, int y) {
@@ -2667,6 +3410,7 @@ static void DrawStation3D(int x, int y, bool fire) {
         BoxC(-0.07f, 0.46f, 0, 0.10f, 0.05f, 0.08f, fl ? A(RED) : A((Color){ 100, 20, 20, 255 }));
         BoxC( 0.07f, 0.46f, 0, 0.10f, 0.05f, 0.08f, fl ? A((Color){ 20, 40, 100, 255 }) : A(SKYBLUE));
     }
+    if (smartCity) DrawStationSmart3D(fire, x, y);
     PopFrame();
 }
 
@@ -2689,6 +3433,7 @@ static void DrawWorks3D(int x, int y) {
     DrawCylinder((Vector3){ cx + 0.25f, 0.24f, cz - 0.2f }, 0.04f, 0.05f, 0.45f, 10, A((Color){ 180, 185, 190, 255 }));
     DrawSphere((Vector3){ cx + 0.25f, 0.72f, cz - 0.2f }, 0.14f, A((Color){ 70, 150, 200, 255 }));        // water tower
     BoxC(cx + 0.2f, 0.28f, cz + 0.26f, 0.3f, 0.04f, 0.3f, A((Color){ 70, 120, 200, 255 }));
+    if (smartCity) FlatSolar(cx + 0.2f, cz + 0.26f, 0.315f, 1, 1, 0, 0, 0.26f, 0.22f, 10.0f);
 }
 
 static void DrawStructure3D(int x, int y) {
@@ -2699,9 +3444,10 @@ static void DrawStructure3D(int x, int y) {
         case T_RUIN:     DrawRuin3D(x, y); break;
         case T_FIRE_STN: DrawStation3D(x, y, true); break;
         case T_POLICE_STN: DrawStation3D(x, y, false); break;
-        case T_POWER:    DrawPlant3D(x, y); break;
+        case T_POWER:    if (smartCity) DrawBattery3D(x, y); else DrawPlant3D(x, y); break;
+        case T_HOSPITAL: DrawHospital3D(x, y); break;
         case T_WATER:    DrawWorks3D(x, y); break;
-        case T_LANDFILL: DrawLandfill3D(x, y); break;
+        case T_LANDFILL: if (IsRecycleTile(x, y) && !gateTile[y][x]) DrawRecycle3D(x, y); else DrawLandfill3D(x, y); break;
         case T_PARK:     DrawParkingLot3D(x, y); break;
         default: break;
     }
@@ -2820,6 +3566,339 @@ static void DrawRoadMarkings3D(int x, int y) {
         }
     }
 }
+// ---------------------------------------------------------------------------
+// 3D drawing - smart city: solar roofs, living walls, smoke traps, drones, ambulance,
+// hospital, recycling plant, battery storage, road monitors, renewable farm
+// ---------------------------------------------------------------------------
+static void SolarPanel(float x, float y, float z, float w, float d, float tilt) {
+    rlPushMatrix(); rlTranslatef(x, y, z); rlRotatef(tilt, 1, 0, 0);
+    BoxT(TX_SOLAR, 0, 0, 0, w, 0.008f, d, A(WHITE));
+    rlPopMatrix();
+}
+
+static void FlatSolar(float cx, float cz, float y, int nx, int nz, float gx, float gz, float pw, float pd, float tilt) {
+    for (int i = 0; i < nx; i++)
+        for (int k = 0; k < nz; k++)
+            SolarPanel(cx + (i - (nx - 1) * 0.5f) * gx, y, cz + (k - (nz - 1) * 0.5f) * gz, pw, pd, tilt);
+}
+
+// panel lying on the +side slope of a gable roof (a = half span, s0..s1 = distance from the ridge, L = half length)
+static void GableSolar(bool alongZ, float a, float y0, float h, float s0, float s1, float L) {
+    float ya = y0 + h * (1.0f - s0 / a) + 0.004f, yb = y0 + h * (1.0f - s1 / a) + 0.004f;
+    Vector3 p0, p1, p2, p3;
+    if (!alongZ) { p0 = (Vector3){ -L, ya, s0 }; p1 = (Vector3){ -L, yb, s1 }; p2 = (Vector3){ L, yb, s1 }; p3 = (Vector3){ L, ya, s0 }; }
+    else         { p0 = (Vector3){ s0, ya, -L }; p1 = (Vector3){ s1, yb, -L }; p2 = (Vector3){ s1, yb, L }; p3 = (Vector3){ s0, ya, L }; }
+    Quad3T(TX_SOLAR, p0, p1, p2, p3, A(WHITE), L * 2.0f / 0.07f, (s1 - s0) / 0.07f);
+}
+
+static void HouseSolar3D(int rtype) {
+    if (rtype == 0)      GableSolar(false, 0.20f, 0.20f, 0.12f, 0.05f, 0.17f, 0.14f);
+    else if (rtype == 1) GableSolar(true,  0.20f, 0.20f, 0.13f, 0.05f, 0.17f, 0.14f);
+    else if (rtype == 2) {
+        float ya = 0.20f + 0.12f * (1.0f - 0.04f / 0.19f) + 0.004f, yb = 0.20f + 0.12f * (1.0f - 0.12f / 0.19f) + 0.004f;
+        Quad3T(TX_SOLAR, (Vector3){ -0.12f, ya, 0.04f }, (Vector3){ -0.06f, yb, 0.12f }, (Vector3){ 0.06f, yb, 0.12f }, (Vector3){ 0.12f, ya, 0.04f }, A(WHITE), 3.0f, 1.2f);
+    } else FlatSolar(-0.05f, -0.08f, 0.245f, 2, 1, 0.19f, 0.0f, 0.16f, 0.15f, 12.0f);
+}
+
+// vertical gardens: a planter ledge with hedge and flowers every other floor, plus climbing plants at the corners
+static void LivingWall(float y0, int floors, float w, int startF) {
+    float o = w * 0.5f + 0.012f;
+    for (int f = startF; f < floors; f += 2) {
+        float y = y0 + f * 0.1f;
+        BoxC(0, y, 0, w + 0.05f, 0.016f, w + 0.05f, A((Color){ 150, 152, 148, 255 }));
+        BoxT(TX_HEDGE, 0, y + 0.03f,  o + 0.012f, w + 0.05f, 0.05f, 0.045f, A(WHITE));
+        BoxT(TX_HEDGE, 0, y + 0.03f, -o - 0.012f, w + 0.05f, 0.05f, 0.045f, A(WHITE));
+        BoxT(TX_HEDGE,  o + 0.012f, y + 0.03f, 0, 0.045f, 0.05f, w + 0.05f, A(WHITE));
+        BoxT(TX_HEDGE, -o - 0.012f, y + 0.03f, 0, 0.045f, 0.05f, w + 0.05f, A(WHITE));
+        if ((f / 2) % 2 == 0) {
+            for (int k = 0; k < 4; k++) {
+                Color fc = (k + f) & 1 ? (Color){ 245, 120, 160, 255 } : (Color){ 250, 225, 90, 255 };
+                DrawSphere((Vector3){ -w * 0.35f + k * w * 0.23f, y + 0.062f, o + 0.03f }, 0.011f, A(fc));
+                DrawSphere((Vector3){ o + 0.03f, y + 0.062f, -w * 0.35f + k * w * 0.23f }, 0.011f, A(fc));
+            }
+        }
+    }
+    float hh = floors * 0.1f;
+    for (int sx = -1; sx <= 1; sx += 2)
+        for (int sz = -1; sz <= 1; sz += 2)
+            BoxT(TX_HEDGE, sx * (w * 0.5f + 0.004f), y0 + hh * 0.5f, sz * (w * 0.5f + 0.004f), 0.032f, hh, 0.032f, A(WHITE));
+}
+
+static void RooftopGarden3D(float h) {          // on the crown of a skyrise
+    BoxT(TX_HEDGE, -0.22f, h + 0.062f, -0.20f, 0.15f, 0.04f, 0.15f, A(WHITE));
+    BoxT(TX_HEDGE,  0.21f, h + 0.062f, -0.20f, 0.12f, 0.04f, 0.15f, A(WHITE));
+    BoxT(TX_HEDGE, -0.22f, h + 0.062f,  0.22f, 0.15f, 0.04f, 0.12f, A(WHITE));
+    DrawSphere((Vector3){ -0.22f, h + 0.115f, -0.20f }, 0.045f, A((Color){ 60, 150, 62, 255 }));
+    DrawSphere((Vector3){  0.21f, h + 0.105f, -0.20f }, 0.038f, A((Color){ 75, 165, 70, 255 }));
+}
+
+// flue-gas scrubber + baghouse beside a factory chimney
+static void SmokeTrap3D(float h) {
+    DrawCylinder((Vector3){ 0.24f, h, 0.06f }, 0.075f, 0.075f, 0.30f, 14, A((Color){ 70, 150, 150, 255 }));
+    DrawCylinder((Vector3){ 0.24f, h + 0.30f, 0.06f }, 0.0f, 0.075f, 0.05f, 14, A((Color){ 55, 118, 122, 255 }));
+    BoxC(0.24f, h + 0.19f, -0.07f, 0.030f, 0.030f, 0.30f, A((Color){ 110, 116, 122, 255 }));          // duct into the stack
+    BoxC(0.36f, h + 0.07f, 0.06f, 0.07f, 0.14f, 0.10f, A((Color){ 185, 190, 195, 255 }));             // baghouse filter
+    DrawCylinder((Vector3){ 0.24f, h + 0.44f, -0.20f }, 0.052f, 0.052f, 0.022f, 12, A((Color){ 80, 215, 130, 255 }));   // "clean" cap
+    DrawSphere((Vector3){ 0.31f, h + 0.22f, 0.06f }, 0.010f, (Color){ 70, 255, 120, 255 });
+}
+
+// ---- drones ------------------------------------------------------------------
+static void DrawDroneModel(int kind, float spinDeg, bool carrying) {
+    Color body = (kind == D_FIRE) ? (Color){ 215, 62, 52, 255 } : (Color){ 245, 247, 250, 255 };
+    Color dark = (Color){ 40, 42, 48, 255 };
+    BoxC(0, 0, 0, 0.075f, 0.026f, 0.075f, A(body));
+    for (int k = 0; k < 2; k++) { rlPushMatrix(); rlRotatef(45.0f + 90.0f * k, 0, 1, 0); BoxC(0, 0.004f, 0, 0.20f, 0.010f, 0.012f, A(dark)); rlPopMatrix(); }
+    for (int sx = -1; sx <= 1; sx += 2)
+        for (int sz = -1; sz <= 1; sz += 2) {
+            float px = sx * 0.07f, pz = sz * 0.07f;
+            DrawCylinder((Vector3){ px, 0.012f, pz }, 0.040f, 0.040f, 0.004f, 10, Fade(WHITE, 0.16f * gAlpha));
+            rlPushMatrix(); rlTranslatef(px, 0.018f, pz); rlRotatef(spinDeg, 0, 1, 0);
+            BoxC(0, 0, 0, 0.085f, 0.003f, 0.010f, A(dark));
+            rlRotatef(90.0f, 0, 1, 0); BoxC(0, 0, 0, 0.085f, 0.003f, 0.010f, A(dark));
+            rlPopMatrix();
+        }
+    bool flash = ((int)(GetTime() * 6.0)) & 1;
+    if (kind == D_POLICE) {
+        BoxC(-0.016f, 0.020f, 0, 0.026f, 0.012f, 0.024f, flash ? (Color){ 255, 40, 40, 255 } : (Color){ 90, 15, 15, 255 });
+        BoxC( 0.016f, 0.020f, 0, 0.026f, 0.012f, 0.024f, flash ? (Color){ 20, 40, 110, 255 } : (Color){ 80, 170, 255, 255 });
+        DrawSphere((Vector3){ 0, -0.024f, 0.014f }, 0.014f, A((Color){ 25, 28, 34, 255 }));                // camera
+    } else if (kind == D_FIRE) {
+        DrawCylinder((Vector3){ 0, -0.052f, 0 }, 0.026f, 0.026f, 0.040f, 10, A((Color){ 235, 235, 238, 255 }));   // water tank
+        BoxC(0, -0.060f, 0.040f, 0.010f, 0.010f, 0.045f, A(dark));                                        // nozzle
+        BoxC(0, 0.018f, 0, 0.030f, 0.008f, 0.012f, flash ? (Color){ 255, 190, 40, 255 } : (Color){ 110, 80, 10, 255 });
+    } else {
+        BoxC(0, 0.016f, 0, 0.034f, 0.006f, 0.010f, A((Color){ 215, 40, 40, 255 }));                       // red cross
+        BoxC(0, 0.016f, 0, 0.010f, 0.006f, 0.034f, A((Color){ 215, 40, 40, 255 }));
+        BoxC(0, 0.020f, 0.030f, 0.012f, 0.008f, 0.012f, flash ? (Color){ 60, 255, 120, 255 } : (Color){ 20, 90, 40, 255 });
+        if (carrying) {                                                                                     // stretcher pod
+            BoxC(0, -0.060f, 0, 0.060f, 0.040f, 0.105f, A((Color){ 245, 245, 248, 255 }));
+            BoxC(0, -0.040f, 0, 0.056f, 0.004f, 0.100f, A((Color){ 90, 150, 200, 255 }));
+            BoxC(0, -0.060f, 0.0535f, 0.026f, 0.008f, 0.004f, A((Color){ 215, 40, 40, 255 }));
+        }
+    }
+}
+
+static void DrawDrone3D(const Drone *d, double t) {
+    float spin = fmodf((float)t * 1500.0f, 360.0f);
+    DrawCylinder((Vector3){ d->x, 0.074f, d->y }, 0.07f + d->z * 0.012f, 0.07f + d->z * 0.012f, 0.002f, 12, (Color){ 0, 0, 0, (unsigned char)Clamp(95.0f - d->z * 14.0f, 25.0f, 95.0f) });
+    PushFrame(d->x, d->z, d->y, d->yaw);
+    rlScalef(1.35f, 1.35f, 1.35f);
+    DrawDroneModel(d->kind, spin, d->carrying);
+    PopFrame();
+    if (d->spraying) {
+        Vector3 a = { d->x, d->z - 0.05f, d->y }, b = { d->sx, 0.10f, d->sy };
+        if (d->kind == D_FIRE) {
+            b.y += 0.06f * sinf((float)t * 12.0f);
+            DrawCylinderEx(a, b, 0.010f, 0.030f, 6, (Color){ 140, 200, 255, 170 });
+            DrawSphere(b, 0.07f, (Color){ 200, 230, 255, 120 });
+        } else if (d->kind == D_POLICE) {
+            DrawCylinderEx(a, b, 0.006f, 0.075f, 8, (Color){ 255, 250, 205, 55 });                          // spotlight beam
+        }
+    }
+}
+
+// parked drone sitting on a roof pad
+static void DrawPad3D(float x, float y, float z, int kind, bool drone) {
+    DrawCylinder((Vector3){ x, y, z }, 0.13f, 0.13f, 0.010f, 20, A((Color){ 52, 56, 64, 255 }));
+    DrawCylinder((Vector3){ x, y + 0.010f, z }, 0.11f, 0.11f, 0.002f, 20, A((Color){ 250, 205, 40, 255 }));
+    DrawCylinder((Vector3){ x, y + 0.012f, z }, 0.095f, 0.095f, 0.002f, 20, A((Color){ 52, 56, 64, 255 }));
+    BoxC(x, y + 0.016f, z, 0.07f, 0.004f, 0.012f, A((Color){ 250, 250, 250, 255 }));
+    BoxC(x, y + 0.016f, z, 0.012f, 0.004f, 0.07f, A((Color){ 250, 250, 250, 255 }));
+    if (drone) { PushFrame(x, y + 0.05f, z, 0.0f); rlScalef(1.2f, 1.2f, 1.2f); DrawDroneModel(kind, 0.0f, false); PopFrame(); }
+}
+static bool PadBusy(int hx, int hy) {
+    for (int i = 0; i < MAX_DRONES; i++) if (drones[i].active && drones[i].homeX == hx && drones[i].homeY == hy) return true;
+    return false;
+}
+
+// roof of a fire / police station in the smart city (local frame of the station, roof at y = 0.43)
+static void DrawStationSmart3D(bool fire, int sx, int sy) {
+    DrawPad3D(fire ? -0.22f : 0.0f, 0.43f, -0.16f, fire ? D_FIRE : D_POLICE, !PadBusy(sx, sy));
+    if (fire) FlatSolar(-0.02f, 0.20f, 0.455f, 3, 1, 0.26f, 0, 0.21f, 0.16f, 12.0f);
+    else      FlatSolar(0.0f, 0.22f, 0.455f, 3, 1, 0.27f, 0, 0.22f, 0.16f, 12.0f);
+}
+
+// ---- ambulance (normal city) --------------------------------------------------
+static void DrawAmbulance3D(const Responder *r, double t) {
+    PushFrame(r->x, 0, r->y, 90.0f - r->angle);
+    Color w = A(WHITE);
+    BoxT(TX_AMBU, 0, 0.074f, -0.030f, 0.125f, 0.100f, 0.22f, w);
+    BoxC(0, 0.062f, 0.130f, 0.118f, 0.074f, 0.085f, A((Color){ 246, 247, 250, 255 }));
+    BoxC(0, 0.078f, 0.176f, 0.100f, 0.042f, 0.006f, A(GLASS));
+    BoxC(0, 0.130f, -0.030f, 0.036f, 0.004f, 0.10f, A((Color){ 215, 40, 40, 255 }));
+    BoxC(0, 0.130f, -0.030f, 0.100f, 0.004f, 0.034f, A((Color){ 215, 40, 40, 255 }));
+    bool f = ((int)(t * 7.0)) % 2 == 0;
+    BoxC(-0.032f, 0.128f, 0.135f, 0.045f, 0.012f, 0.020f, f ? (Color){ 255, 40, 40, 255 } : (Color){ 110, 20, 20, 255 });
+    BoxC( 0.032f, 0.128f, 0.135f, 0.045f, 0.012f, 0.020f, f ? (Color){ 20, 60, 255, 255 } : (Color){ 20, 30, 110, 255 });
+    Wheels(0.125f, 0.30f, 2);
+    PopFrame();
+}
+
+// ---- hospital -----------------------------------------------------------------
+static void DrawHospital3D(int x, int y) {
+    float cx = x + 0.5f, cz = y + 0.5f;
+    bool dmg = health[y][x] < 50.0f;
+    Color tint = A(dmg ? (Color){ 120, 100, 95, 255 } : WHITE);
+    PushFrame(cx, 0, cz, FaceYaw(faceDir[y][x]));
+    BoxT(TX_HOSP, 0, 0.17f, -0.02f, 0.90f, 0.34f, 0.70f, tint);
+    BoxT(TX_HOSP, -0.22f, 0.37f, -0.12f, 0.36f, 0.74f, 0.36f, tint);
+    BoxC(0, 0.355f, -0.02f, 0.94f, 0.03f, 0.74f, A((Color){ 150, 152, 158, 255 }));
+    BoxC(-0.22f, 0.755f, -0.12f, 0.40f, 0.03f, 0.40f, A((Color){ 150, 152, 158, 255 }));
+    BoxC(-0.22f, 0.62f, 0.064f, 0.19f, 0.19f, 0.006f, A(WHITE));                                  // red cross sign
+    BoxC(-0.22f, 0.62f, 0.070f, 0.13f, 0.042f, 0.006f, A((Color){ 215, 35, 40, 255 }));
+    BoxC(-0.22f, 0.62f, 0.070f, 0.042f, 0.13f, 0.006f, A((Color){ 215, 35, 40, 255 }));
+    BoxC(0.22f, 0.15f, 0.40f, 0.36f, 0.022f, 0.17f, A((Color){ 205, 55, 55, 255 }));            // emergency canopy
+    for (int s = -1; s <= 1; s += 2) BoxC(0.22f + s * 0.16f, 0.075f, 0.45f, 0.016f, 0.15f, 0.016f, A((Color){ 235, 235, 238, 255 }));
+    BoxC(0.22f, 0.012f, 0.40f, 0.30f, 0.004f, 0.14f, A((Color){ 215, 40, 40, 255 }));
+    BoxC(0.22f, 0.09f, 0.352f, 0.20f, 0.12f, 0.006f, A((Color){ 70, 110, 150, 255 }));          // glass doors
+    if (smartCity) {
+        DrawPad3D(-0.22f, 0.77f, -0.12f, D_MEDIC, !PadBusy(x, y));
+        FlatSolar(0.22f, -0.16f, 0.39f, 2, 2, 0.20f, 0.18f, 0.17f, 0.14f, 12.0f);
+    }
+    PopFrame();
+}
+
+// ---- battery storage (replaces the power plant in the smart city) ------------------
+static void DrawBattery3D(int x, int y) {
+    float cx = x + 0.5f, cz = y + 0.5f;
+    BoxT(TX_CONCRETE, cx, 0.02f, cz, 0.94f, 0.04f, 0.94f, A(WHITE));
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < 2; k++) {
+            float px = cx - 0.21f + i * 0.42f, pz = cz - 0.20f + k * 0.34f;
+            BoxT(TX_CORRUG, px, 0.15f, pz, 0.36f, 0.22f, 0.28f, A((Color){ 215, 240, 225, 255 }));
+            BoxC(px, 0.27f, pz, 0.38f, 0.014f, 0.30f, A((Color){ 90, 120, 105, 255 }));
+            for (int s = 0; s < 5; s++) BoxC(px - 0.12f + s * 0.06f, 0.15f, pz + 0.142f, 0.03f, 0.10f, 0.004f, A((Color){ 60, 215, 120, 255 }));
+        }
+    DrawCylinder((Vector3){ cx - 0.35f, 0.04f, cz + 0.36f }, 0.06f, 0.06f, 0.14f, 10, A((Color){ 170, 175, 182, 255 }));   // transformer
+    BoxC(cx + 0.25f, 0.12f, cz + 0.37f, 0.30f, 0.16f, 0.10f, A((Color){ 140, 150, 160, 255 }));                          // inverters
+    float fill = Clamp(batteryPct / 100.0f, 0.0f, 1.0f);                                                                  // charge gauge
+    BoxC(cx + 0.42f, 0.34f, cz, 0.04f, 0.60f, 0.04f, A((Color){ 40, 44, 50, 255 }));
+    Color gc = fill > 0.5f ? (Color){ 70, 230, 120, 255 } : (fill > 0.2f ? (Color){ 250, 205, 50, 255 } : (Color){ 240, 70, 60, 255 });
+    BoxC(cx + 0.42f, 0.04f + 0.30f * fill, cz, 0.05f, 0.60f * fill, 0.05f, gc);
+    FlatSolar(cx, cz + 0.02f, 0.30f, 2, 2, 0.42f, 0.34f, 0.30f, 0.22f, 10.0f);
+}
+
+// ---- recycling plant (part of the old landfill site) -------------------------------
+static void RecycleSign3D(float cx, float y, float cz) {
+    DrawCylinder((Vector3){ cx, y, cz }, 0.17f, 0.17f, 0.012f, 24, A((Color){ 40, 160, 90, 255 }));
+    for (int k = 0; k < 3; k++) {
+        PushFrame(cx, y + 0.014f, cz, k * 120.0f + (float)GetTime() * 20.0f);
+        BoxC(0.08f, 0, 0, 0.09f, 0.008f, 0.026f, A((Color){ 245, 250, 245, 255 }));
+        Tri3T(TX_CONCRETE, (Vector3){ 0.135f, 0.004f, 0.034f }, (Vector3){ 0.135f, 0.004f, -0.034f }, (Vector3){ 0.175f, 0.004f, 0.0f }, A((Color){ 245, 250, 245, 255 }), 0.1f, 0.1f);
+        PopFrame();
+    }
+}
+
+static void DrawRecycle3D(int x, int y) {
+    unsigned char v = vr[y][x];
+    float cx = x + 0.5f, cz = y + 0.5f, t = (float)GetTime();
+    static const Color bale[5] = { {70,110,190,255}, {190,195,202,255}, {205,170,110,255}, {85,160,95,255}, {225,225,120,255} };
+    if (x == 20 && y == 11) {                                         // main sorting hall
+        BoxT(TX_CORRUG, cx, 0.20f, cz, 0.94f, 0.40f, 0.86f, A((Color){ 190, 235, 210, 255 }));
+        for (int k = 0; k < 3; k++) { rlPushMatrix(); rlTranslatef(cx - 0.31f + k * 0.31f, 0, cz); RoofGable(0.30f, 0.86f, 0.40f, 0.07f, true, A((Color){ 60, 150, 110, 255 }), TX_CORRUG, A((Color){ 200, 230, 215, 255 })); rlPopMatrix(); }
+        BoxC(cx, 0.30f, cz + 0.436f, 0.94f, 0.06f, 0.012f, A((Color){ 40, 160, 90, 255 }));
+        BoxC(cx - 0.2f, 0.10f, cz + 0.436f, 0.28f, 0.18f, 0.012f, A((Color){ 80, 95, 100, 255 }));
+        RecycleSign3D(cx, 0.49f, cz);
+        DrawCylinder((Vector3){ cx + 0.34f, 0.40f, cz - 0.28f }, 0.035f, 0.04f, 0.20f, 10, A((Color){ 170, 175, 180, 255 }));
+        FlatSolar(cx + 0.02f, cz - 0.24f, 0.495f, 3, 1, 0.28f, 0, 0.22f, 0.16f, 10.0f);
+    } else if (x == 20) {                                              // conveyor + bale presses
+        BoxT(TX_CORRUG, cx - 0.05f, 0.14f, cz, 0.84f, 0.28f, 0.80f, A((Color){ 200, 220, 210, 255 }));
+        BoxC(cx - 0.05f, 0.285f, cz, 0.86f, 0.014f, 0.82f, A((Color){ 70, 140, 105, 255 }));
+        BoxC(cx + 0.0f, 0.045f, cz, 0.10f, 0.03f, 0.96f, A((Color){ 55, 58, 64, 255 }));
+        for (int i = 0; i < 6; i++) {
+            float zz = cz - 0.46f + fmodf(t * 0.35f + i * 0.17f, 1.0f) * 0.92f;
+            BoxC(cx, 0.066f, zz, 0.08f, 0.012f, 0.045f, A(bale[(v + i) % 5]));
+        }
+        for (int i = 0; i < 3; i++) BoxT(TX_CORRUG, cx + 0.34f, 0.07f + (i % 2) * 0.0f, cz - 0.30f + i * 0.30f, 0.20f, 0.12f, 0.18f, A(bale[(v + i) % 5]));
+        FlatSolar(cx - 0.05f, cz, 0.30f, 2, 3, 0.36f, 0.22f, 0.30f, 0.18f, 10.0f);
+    } else {                                                           // sorting yard: skips, bales, loader
+        BoxT(TX_CONCRETE, cx, 0.012f, cz, 0.98f, 0.024f, 0.98f, A(WHITE));
+        for (int i = 0; i < 4; i++) {
+            float px = cx - 0.33f + (i % 2) * 0.50f, pz = cz - 0.30f + (i / 2) * 0.28f;
+            BoxT(TX_CORRUG, px, 0.07f, pz, 0.30f, 0.12f, 0.20f, A(bale[(v + i) % 5]));
+            if ((v >> i) & 1) BoxT(TX_CORRUG, px, 0.19f, pz, 0.28f, 0.10f, 0.18f, A(bale[(v + i + 2) % 5]));
+        }
+        PushFrame(cx + 0.05f, 0.03f, cz + 0.30f, (y == 10) ? 90.0f : -90.0f);
+        DrawVehicleLocal(V_TRUCK, (Color){ 60, 150, 90, 255 }, false, NightNow());
+        PopFrame();
+    }
+}
+
+// ---- smart traffic monitors -------------------------------------------------------
+static void DrawMonitor3D(int x, int y) {
+    float cx = x + 0.5f, cz = y + 0.5f;
+    bool horiz = (RoadLine(x, y) == 1);
+    float px = horiz ? cx + 0.05f : cx + 0.465f, pz = horiz ? cz + 0.465f : cz + 0.05f;
+    float ax = horiz ? 0.0f : -1.0f, az = horiz ? -1.0f : 0.0f;          // direction towards the road
+    Color mast = A((Color){ 85, 95, 108, 255 });
+    BoxC(px, 0.15f, pz, 0.014f, 0.30f, 0.014f, mast);
+    float hx = px + ax * 0.20f, hz = pz + az * 0.20f;
+    BoxC((px + hx) * 0.5f, 0.30f, (pz + hz) * 0.5f, horiz ? 0.012f : 0.20f, 0.012f, horiz ? 0.20f : 0.012f, mast);
+    BoxC(hx, 0.29f, hz, 0.055f, 0.035f, 0.055f, A((Color){ 30, 38, 52, 255 }));
+    DrawSphere((Vector3){ hx, 0.268f, hz }, 0.014f, (Color){ 120, 220, 255, 255 });                  // lens
+    Color rc = CongColor(traffic[y][x], 1.0f);
+    DrawCylinder((Vector3){ hx, 0.31f, hz }, 0.030f, 0.030f, 0.010f, 12, rc);                         // congestion status ring
+    SolarPanel(px, 0.325f, pz, 0.07f, 0.05f, 12.0f);
+    if (NightNow() || st.daylight < 0.7f) DrawCylinderEx((Vector3){ hx, 0.265f, hz }, (Vector3){ cx + ax * 0.45f * 0.0f, 0.07f, cz }, 0.004f, 0.10f, 8, (Color){ 120, 220, 255, 26 });
+}
+
+// ---- renewable farm east of the city ----------------------------------------------
+static void DrawTurbine3D(float tx, float tz, float t) {
+    DrawCylinder((Vector3){ tx, 0, tz }, 0.016f, 0.034f, 1.10f, 10, A((Color){ 235, 238, 242, 255 }));
+    BoxC(tx - 0.02f, 1.12f, tz, 0.10f, 0.05f, 0.05f, A((Color){ 225, 228, 232, 255 }));
+    float ang = t * (30.0f + 300.0f * WindFactor()) + tx * 37.0f;
+    rlPushMatrix(); rlTranslatef(tx - 0.075f, 1.12f, tz); rlRotatef(ang, 1, 0, 0);
+    DrawSphere((Vector3){ 0, 0, 0 }, 0.028f, A((Color){ 240, 242, 246, 255 }));
+    for (int k = 0; k < 3; k++) {
+        rlPushMatrix(); rlRotatef(k * 120.0f, 1, 0, 0);
+        BoxC(0, 0.23f, 0, 0.010f, 0.44f, 0.034f, A((Color){ 245, 247, 250, 255 }));
+        rlPopMatrix();
+    }
+    rlPopMatrix();
+}
+
+static void DrawFarm3D(void) {
+    float t = (float)GetTime();
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = MAP_W; x < MAP_W + FARM_W; x++) {
+            bool road = (y == FARM_ROAD_Y);
+            if (road) {
+                BoxT(TX_ASPHALT, x + 0.5f, 0.03f, y + 0.5f, 1.0f, 0.06f, 1.0f, WHITE);
+                BoxC(x + 0.5f, 0.066f, y + 0.5f, 0.5f, 0.012f, 0.045f, COL_LINE);
+            } else BoxT(TX_GRASS, x + 0.5f, 0.015f, y + 0.5f, 1.0f, 0.03f, 1.0f, (Color){ 225, 240, 200, 255 });
+        }
+    // solar field: rows of tilted tables
+    for (int y = FARM_SOLAR_Y0; y <= FARM_SOLAR_Y1; y++)
+        for (int x = FARM_SOLAR_X0; x <= FARM_SOLAR_X1; x++)
+            for (int i = 0; i < 2; i++)
+                for (int k = 0; k < 2; k++) {
+                    float px = x + 0.25f + i * 0.5f, pz = y + 0.27f + k * 0.46f;
+                    BoxC(px, 0.045f, pz - 0.05f, 0.34f, 0.07f, 0.012f, A((Color){ 120, 124, 130, 255 }));        // rear support
+                    SolarPanel(px, 0.085f, pz, 0.40f, 0.30f, 24.0f);
+                }
+    // turbines
+    for (int i = 0; i < N_TURB; i++) DrawTurbine3D(TURB_POS[i][0], TURB_POS[i][1], t);
+    // grid hub: battery containers + transformer
+    BoxT(TX_CONCRETE, 24.5f, 0.02f, 12.6f, 0.95f, 0.04f, 3.0f, WHITE);
+    for (int k = 0; k < 3; k++) {
+        BoxT(TX_CORRUG, 24.5f, 0.17f, 11.5f + k * 1.0f, 0.70f, 0.26f, 0.80f, A((Color){ 215, 240, 225, 255 }));
+        for (int s = 0; s < 6; s++) BoxC(24.5f - 0.25f + s * 0.1f, 0.17f, 11.5f + k * 1.0f + 0.404f, 0.05f, 0.12f, 0.004f, A((Color){ 60, 215, 120, 255 }));
+    }
+    DrawCylinder((Vector3){ 25.1f, 0.04f, 12.0f }, 0.07f, 0.07f, 0.22f, 10, A((Color){ 170, 175, 182, 255 }));
+    // perimeter fence (north, south, east)
+    Color fc = A((Color){ 150, 155, 160, 255 });
+    for (int x = MAP_W; x <= MAP_W + FARM_W; x++) { BoxC((float)x, 0.06f, 0.0f, 0.012f, 0.12f, 0.012f, fc); BoxC((float)x, 0.06f, (float)MAP_H, 0.012f, 0.12f, 0.012f, fc); }
+    for (int y = 0; y <= MAP_H; y++) BoxC((float)(MAP_W + FARM_W), 0.06f, (float)y, 0.012f, 0.12f, 0.012f, fc);
+    BoxC(MAP_W + FARM_W * 0.5f, 0.10f, 0.0f, (float)FARM_W, 0.008f, 0.008f, fc);
+    BoxC(MAP_W + FARM_W * 0.5f, 0.10f, (float)MAP_H, (float)FARM_W, 0.008f, 0.008f, fc);
+    BoxC((float)(MAP_W + FARM_W), 0.10f, MAP_H * 0.5f, 0.008f, 0.008f, (float)MAP_H, fc);
+    // power line along the road back to the city
+    for (int x = MAP_W; x < MAP_W + FARM_W; x += 2) {
+        BoxC(x + 0.5f, 0.20f, FARM_ROAD_Y + 0.05f, 0.012f, 0.40f, 0.012f, A((Color){ 105, 90, 70, 255 }));
+        BoxC(x + 0.5f, 0.39f, FARM_ROAD_Y + 0.05f, 0.012f, 0.012f, 0.14f, A((Color){ 105, 90, 70, 255 }));
+    }
+    BoxC(MAP_W + FARM_W * 0.5f - 0.5f, 0.39f, FARM_ROAD_Y + 0.05f, (float)FARM_W, 0.004f, 0.004f, A((Color){ 30, 30, 34, 255 }));
+}
 
 // ---- orbit camera + picking + pipe networks + weather overlay (unchanged) ----
 static Camera3D BuildCamera(void) {
@@ -2836,8 +3915,8 @@ static Camera3D BuildCamera(void) {
 }
 
 static void ResetCamera(void) {
-    oc.target = (Vector3){ MAP_W / 2.0f, 0.0f, MAP_H / 2.0f };
-    oc.yaw = 0.0f; oc.pitch = 1.0f; oc.dist = 24.0f;
+    oc.target = (Vector3){ (MAP_W + (smartCity ? FARM_W : 0)) / 2.0f, 0.0f, MAP_H / 2.0f };
+    oc.yaw = 0.0f; oc.pitch = 1.0f; oc.dist = smartCity ? 29.0f : 24.0f;
 }
 
 static void UpdateOrbit(float dt) {
@@ -2858,8 +3937,8 @@ static void UpdateOrbit(float dt) {
     float w = GetMouseWheelMove();
     if (w != 0.0f) oc.dist -= w * 2.0f;
     oc.pitch = Clamp(oc.pitch, 0.25f, 1.5f);
-    oc.dist = Clamp(oc.dist, 4.0f, 40.0f);
-    oc.target.x = Clamp(oc.target.x, -3.0f, MAP_W + 3.0f);
+    oc.dist = Clamp(oc.dist, 4.0f, 46.0f);
+    oc.target.x = Clamp(oc.target.x, -3.0f, MAP_W + FARM_W + 3.0f);
     oc.target.z = Clamp(oc.target.z, -3.0f, MAP_H + 3.0f);
 }
 
@@ -2909,12 +3988,13 @@ static void DrawWeatherFx(void) {
 // ---------------------------------------------------------------------------
 static void DrawPed3D(const Ped *p) {
     float yaw = 0.0f;
-    bool walking = (p->wi < p->wn) && !(p->crossing && p->wi == 1 && !p->started) && !p->robbing;
+    bool walking = (p->wi < p->wn) && !(p->crossing && p->wi == 1 && !p->started) && !p->robbing && !p->ill;
     if (p->wi < p->wn) yaw = atan2f(p->wx[p->wi] - p->x, p->wy[p->wi] - p->y) * RAD2DEG;
     float sw = walking ? sinf(p->phase) * 30.0f : 0.0f;
     Color shirt = A(p->shirt), pants = A(p->pants), skin = A((Color){ 235, 190, 160, 255 });
     static const Color hair[4] = { {40,30,25,255}, {95,65,40,255}, {200,170,90,255}, {150,150,155,255} };
     PushFrame(p->x, 0.0f, p->y, yaw);
+    if (p->ill) { rlTranslatef(0.0f, 0.020f, 0.0f); rlRotatef(-86.0f, 1, 0, 0); }       // collapsed on the pavement
     for (int s = -1; s <= 1; s += 2) {
         rlPushMatrix(); rlTranslatef(s * 0.011f, 0.052f, 0); rlRotatef(s * sw, 1, 0, 0);
         BoxC(0, -0.026f, 0, 0.016f, 0.052f, 0.018f, pants);
@@ -2931,6 +4011,12 @@ static void DrawPed3D(const Ped *p) {
     if (p->criminal) BoxC(0, 0.126f, 0.015f, 0.032f, 0.008f, 0.005f, A((Color){ 20, 20, 20, 255 }));   // mask
     if (p->robbing) BoxC(0, 0.20f + 0.02f * sinf((float)GetTime() * 10.0f), 0, 0.02f, 0.05f, 0.02f, RED);
     PopFrame();
+    if (p->ill) {                                                                      // medical-emergency marker
+        float by = 0.20f + 0.015f * sinf((float)GetTime() * 6.0f);
+        BoxC(p->x, by, p->y, 0.050f, 0.050f, 0.012f, A(WHITE));
+        BoxC(p->x, by, p->y, 0.034f, 0.010f, 0.014f, A((Color){ 215, 35, 40, 255 }));
+        BoxC(p->x, by, p->y, 0.010f, 0.034f, 0.014f, A((Color){ 215, 35, 40, 255 }));
+    }
 }
 
 static void DrawPoliceCar3D(const Responder *r, double t) {
@@ -3068,7 +4154,7 @@ static void DrawGround3D(int x, int y, bool xray) {
     }
     if (xray)                BoxC(cx, 0.015f, cz, 1.0f, 0.03f, 1.0f, COL_SOIL);
     else if (s == T_PARK)    BoxT(TX_ASPHALT, cx, 0.03f, cz, 1.0f, 0.06f, 1.0f, WHITE);
-    else if (s == T_LANDFILL) BoxT(TX_TRASH, cx, 0.015f, cz, 1.0f, 0.03f, 1.0f, WHITE);
+    else if (s == T_LANDFILL) { if (IsRecycleTile(x, y)) BoxT(TX_CONCRETE, cx, 0.02f, cz, 1.0f, 0.04f, 1.0f, (Color){ 215, 215, 215, 255 }); else BoxT(TX_TRASH, cx, 0.015f, cz, 1.0f, 0.03f, 1.0f, WHITE); }
     else if (paved[y][x])    BoxT(TX_CONCRETE, cx, 0.02f, cz, 1.0f, 0.04f, 1.0f, (Color){ 215, 215, 215, 255 });
     else                     BoxT(TX_GRASS, cx, 0.015f, cz, 1.0f, 0.03f, 1.0f, (s == T_HOUSE) ? (Color){ 235, 255, 235, 255 } : WHITE);
     if (layerOn[L_ROADS]) {
@@ -3111,7 +4197,7 @@ static void DrawScene3D(void) {
                 if (!xray) DrawGrassTufts(x, y);
                 if (deco[y][x] && !paved[y][x]) DrawDeco3D(x, y);
             } else if (s == T_ROAD) {
-                if (layerOn[L_ROADS]) DrawJunction3D(x, y, xray);
+                if (layerOn[L_ROADS]) { DrawJunction3D(x, y, xray); if (smartCity && monitorTile[y][x]) DrawMonitor3D(x, y); }
             } else if (layerOn[L_BUILDINGS]) {
                 DrawStructure3D(x, y);
                 if (s == T_BUILDING && bType[y][x] == B_IND && zone[y][x] == Z_INDUSTRIAL) {}
@@ -3128,16 +4214,18 @@ static void DrawScene3D(void) {
             if (fireI[y][x] > 0.0f) BoxC(x + 0.5f, 0.07f, y + 0.5f, 0.85f, 0.01f, 0.85f, Fade(COL_FIRE, 0.15f + 0.3f * fireI[y][x] / 100.0f));
         }
     gAlpha = 1.0f;
-    if (layerOn[L_BUILDINGS]) { DrawFences3D(); DrawLandfillLife3D(); }
+    if (layerOn[L_BUILDINGS]) { DrawFences3D(); DrawLandfillLife3D(); if (smartCity) DrawFarm3D(); }
 
     // Vehicles and people
     if (layerOn[L_TRAFFIC])
         for (int i = 0; i < MAX_CARS; i++) if (cars[i].active) DrawCar3D(&cars[i]);
     for (int i = 0; i < MAX_TRUCKS; i++) if (trucks[i].active) DrawFireTruck3D(&trucks[i], t);
     for (int i = 0; i < MAX_POLICE; i++) if (police[i].active) DrawPoliceCar3D(&police[i], t);
+    for (int i = 0; i < MAX_AMB; i++) if (ambs[i].active) DrawAmbulance3D(&ambs[i], t);
     for (int i = 0; i < MAX_PEDS; i++) if (peds[i].active) DrawPed3D(&peds[i]);
 
     DrawParticles3D();
+    for (int i = 0; i < MAX_DRONES; i++) if (drones[i].active) DrawDrone3D(&drones[i], t);
     if (hoverOK) DrawCubeWires((Vector3){ hoverX + 0.5f, 0.05f, hoverY + 0.5f }, 1.0f, 0.1f, 1.0f, WHITE);
     rlEnableBackfaceCulling();
 }
@@ -3150,6 +4238,17 @@ static int uiY;
 
 static Rectangle LayerRect(int i) { return (Rectangle){ 10, (float)(LAYER_Y0 + i * LAYER_H), PANEL_W - 20, LAYER_H - 2 }; }
 static Rectangle ViewBtnRect(void) { return (Rectangle){ 10, 26, PANEL_W - 20, 18 }; }
+static Rectangle SmartBtnRect(void) { return (Rectangle){ 10, 48, PANEL_W - 20, 22 }; }
+
+// 2D view: the smart city is drawn zoomed out so the renewable farm east of the map fits
+static float View2DZoom(void) { return smartCity ? (float)VIEW_W / (float)((MAP_W + FARM_W) * TILE) : 1.0f; }
+static float View2DOffY(void) { return ((float)VIEW_H - (float)VIEW_H * View2DZoom()) * 0.5f; }
+
+static void ToggleSmartCity(void) {
+    smartCity = !smartCity;
+    ResetCamera();
+    UpdateMaps(); UpdateStats();                  // refresh the numbers straight away
+}
 
 static void StatRow(const char *label, const char *val, Color c) {
     DrawText(label, 12, uiY, 10, COL_LABEL);
@@ -3182,7 +4281,13 @@ static void DrawLeftPanel(void) {
     DrawRectangleRec(vb, CheckCollisionPointRec(m, vb) ? (Color){ 55, 65, 85, 255 } : (Color){ 42, 48, 60, 255 });
     DrawText(TextFormat("View: %s   [V]", viewMode == VIEW_2D ? "2D top-down" : "3D free camera"), (int)vb.x + 8, (int)vb.y + 4, 10, SKYBLUE);
 
-    DrawText("LAYERS  (click or press 1-8)", 12, 50, 10, GRAY);
+    Rectangle sb = SmartBtnRect();
+    DrawRectangleRec(sb, smartCity ? (CheckCollisionPointRec(m, sb) ? (Color){ 40, 120, 70, 255 } : (Color){ 30, 100, 58, 255 })
+                                   : (CheckCollisionPointRec(m, sb) ? (Color){ 70, 62, 40, 255 } : (Color){ 52, 48, 36, 255 }));
+    DrawRectangleLinesEx(sb, 1.0f, smartCity ? (Color){ 90, 220, 140, 255 } : (Color){ 150, 130, 70, 255 });
+    DrawText(smartCity ? "SMART CITY: ON    [T] switch back" : "NORMAL CITY    [T] go smart", (int)sb.x + 8, (int)sb.y + 6, 10, smartCity ? (Color){ 150, 255, 190, 255 } : (Color){ 245, 215, 120, 255 });
+
+    DrawText("LAYERS  (click or press 1-8)", 12, LAYER_Y0 - 12, 10, GRAY);
     for (int i = 0; i < L_COUNT; i++) {
         Rectangle r = LayerRect(i);
         if (CheckCollisionPointRec(m, r)) DrawRectangleRec(r, (Color){ 40, 46, 58, 255 });
@@ -3199,7 +4304,7 @@ static void DrawLeftPanel(void) {
     StatRow("Population", TextFormat("%d", st.population), GREEN);
     StatRow("Buildings", TextFormat("%d  (%d damaged)", st.buildings, st.damaged), RAYWHITE);
     StatRow("Green space", TextFormat("%.0f%%", st.green), (Color){ 110, 200, 100, 255 });
-    StatBar("Energy", TextFormat("%.1f / %.1f MW", st.energyDemand / 1000.0f, st.energyCap / 1000.0f), st.energyPct, ORANGE);
+    StatBar(smartCity ? "Energy (renewable supply)" : "Energy (power plant)", TextFormat("%.1f / %.1f MW", st.energyDemand / 1000.0f, st.energyCap / 1000.0f), st.energyPct, ORANGE);
     StatBar("Water supply", TextFormat("%.1f / %.1f kL/min", st.waterDemand / 1000.0f, st.waterCap / 1000.0f), st.waterPct, COL_WATER_PIPE);
     StatBar("Sewer load", TextFormat("%.0f%%", st.sewerPct), st.sewerPct, (Color){ 190, 140, 80, 255 });
     StatBar("Air quality", TextFormat("AQI %.0f", st.aqi), st.aqi / 1.5f, (Color){ 190, 90, 190, 255 });
@@ -3213,13 +4318,19 @@ static void DrawLeftPanel(void) {
     StatRow("Road offences", TextFormat("%d seen / %d reported", offences, reports), (Color){ 250, 170, 80, 255 });
     StatRow("Police chases", TextFormat("%d caught / %d escaped", caught, escaped), SKYBLUE);
     StatRow("Security index", TextFormat("%.0f%%", st.security), LIGHTGRAY);
+    StatRow("Medical", TextFormat("%d calls / %d saved / %d lost", medCalls, medSaved, medLost), (Color){ 255, 120, 130, 255 });
+    if (smartCity) StatRow("Recycling", TextFormat("%.0f%% diverted  (%.0f t)", recycledT + wasteT > 0 ? 100.0f * recycledT / (recycledT + wasteT) : 64.0f, recycledT), (Color){ 90, 220, 140, 255 });
+    else           StatRow("Power source", "fuel-burning plant", (Color){ 200, 160, 110, 255 });
 
     uiY += 3;
     DrawText("ALERTS", 12, uiY, 10, GRAY);
     uiY += 12;
     int n = 0, pending = 0;
     for (int i = 0; i < MAX_CARS; i++) if (cars[i].active && cars[i].wanted) pending++;
-    if (st.energyPct > 100.0f) Alert("! Power shortage (brownout)", &n);
+    int illNow = 0; for (int i = 0; i < MAX_PEDS; i++) if (peds[i].active && peds[i].ill) illNow++;
+    if (!smartCity && st.energyPct > 100.0f) Alert("! Power shortage (brownout)", &n);
+    if (smartCity && gridImportKW > 1.0f) Alert("! Battery flat - importing backup power", &n);
+    if (illNow > 0)            Alert(TextFormat("! %d medical emergenc%s", illNow, illNow == 1 ? "y" : "ies"), &n);
     if (st.waterPct > 100.0f)  Alert("! Water shortage", &n);
     if (st.sewerPct > 100.0f)  Alert("! Sewer overflow - flooding", &n);
     if (landfillFill > 90.0f)  Alert("! Landfill nearly full", &n);
@@ -3231,7 +4342,7 @@ static void DrawLeftPanel(void) {
     DrawText("3D: WASD move  Q/E turn  Wheel zoom", 12, SCREEN_H - 48, 10, DARKGRAY);
     DrawText("RMB drag: tilt/turn   R: reset cam", 12, SCREEN_H - 37, 10, DARKGRAY);
     DrawText("SPACE: storm   Click: start fire", 12, SCREEN_H - 26, 10, DARKGRAY);
-    DrawText("P: pause   +/-: sim speed", 12, SCREEN_H - 15, 10, DARKGRAY);
+    DrawText("P: pause  +/-: speed  T: smart city", 12, SCREEN_H - 15, 10, DARKGRAY);
 }
 
 static void DrawGraph(int x, int y, int w, int h, int g, const char *label, Color col,
@@ -3267,7 +4378,7 @@ static void DrawRightPanel(void) {
     DrawLine(x0, 0, x0, SCREEN_H, (Color){ 55, 65, 80, 255 });
     DrawText("CITY TRENDS  (last 2 min)", x0 + 12, 4, 10, GRAY);
 
-    int gx = x0 + 10, gw = PANEL_W - 20, gh = 77, y = 18, pitch = 79;
+    int pitch = (SCREEN_H - 22) / 7, gx = x0 + 10, gw = PANEL_W - 20, gh = pitch - 2, y = 18;
     DrawGraph(gx, y + 0 * pitch, gw, gh, G_ENERGY, "Energy demand", ORANGE, TextFormat("%.1f MW", st.energyDemand / 1000.0f), 2.0f, false);
     DrawGraph(gx, y + 1 * pitch, gw, gh, G_WATER,  "Water demand", COL_WATER_PIPE, TextFormat("%.1f kL/min", st.waterDemand / 1000.0f), 1.0f, false);
     DrawGraph(gx, y + 2 * pitch, gw, gh, G_SEWER,  "Sewer load (% capacity)", (Color){ 190, 140, 80, 255 }, TextFormat("%.0f%%", st.sewerPct), 100.0f, true);
@@ -3275,6 +4386,48 @@ static void DrawRightPanel(void) {
     DrawGraph(gx, y + 4 * pitch, gw, gh, G_TEMP,   "Temperature (C)", YELLOW, TextFormat("%.1f C", st.temp), 6.0f, false);
     DrawGraph(gx, y + 5 * pitch, gw, gh, G_RAIN,   "Rainfall (mm/h)", SKYBLUE, TextFormat("%.1f", st.rainMm), 5.0f, true);
     DrawGraph(gx, y + 6 * pitch, gw, gh, G_CARS,   "Vehicles on road", (Color){ 240, 210, 50, 255 }, TextFormat("%d", st.vehicles), 20.0f, true);
+}
+
+// ---------------------------------------------------------------------------
+// Status strip under the map
+// ---------------------------------------------------------------------------
+static void DrawStatusStrip(void) {
+    int x0 = PANEL_W, y0 = VIEW_H, w = VIEW_W, h = SCREEN_H - VIEW_H;
+    DrawRectangle(x0, y0, w, h, (Color){ 22, 26, 32, 255 });
+    DrawLine(x0, y0, x0 + w, y0, (Color){ 55, 65, 80, 255 });
+    int out = 0; for (int i = 0; i < MAX_DRONES; i++) if (drones[i].active) out++;
+    int dP = 0, dF = 0, dM = 0;
+    for (int i = 0; i < MAX_DRONES; i++) if (drones[i].active) { if (drones[i].kind == D_POLICE) dP++; else if (drones[i].kind == D_FIRE) dF++; else dM++; }
+    int amb = 0; for (int i = 0; i < MAX_AMB; i++) if (ambs[i].active) amb++;
+    float resp = respN ? respSum / respN : 0.0f, trans = transN ? transSum / transN : 0.0f;
+
+    if (!smartCity) {
+        DrawText("NORMAL CITY", x0 + 10, y0 + 7, 14, (Color){ 245, 215, 120, 255 });
+        DrawText("Power plant burns fuel. Fire engines, police cars and ambulances respond by road. Press T for the SMART CITY.", x0 + 10, y0 + 26, 10, GRAY);
+        DrawText(TextFormat("Fuel burn %.1f MW   |   Ambulances out %d   |   Medical: response %.1fs, to hospital %.1fs   |   Avg road speed %.2f",
+                 st.energyDemand / 1000.0f, amb, resp, trans, avgSpeed), x0 + 10, y0 + 42, 10, LIGHTGRAY);
+        return;
+    }
+    DrawText("SMART CITY", x0 + 10, y0 + 6, 14, (Color){ 120, 240, 160, 255 });
+    // energy mix bar: roofs / solar farm / wind / backup import against demand
+    float supply = roofSolarKW + farmSolarKW + windKW + gridImportKW;
+    float scale = fmaxf(supply, st.energyDemand) * 1.05f + 1.0f;
+    int bx = x0 + 120, by = y0 + 8, bw = 330, bh = 12;
+    DrawRectangle(bx, by, bw, bh, (Color){ 40, 46, 56, 255 });
+    float cur = 0.0f;
+    struct { float v; Color c; } seg[4] = { { roofSolarKW, { 250, 215, 70, 255 } }, { farmSolarKW, { 240, 160, 50, 255 } }, { windKW, { 110, 190, 255, 255 } }, { gridImportKW, { 235, 80, 70, 255 } } };
+    for (int i = 0; i < 4; i++) { int ww = (int)(bw * seg[i].v / scale); DrawRectangle(bx + (int)(bw * cur / scale), by, ww, bh, seg[i].c); cur += seg[i].v; }
+    int dx = bx + (int)(bw * st.energyDemand / scale);
+    DrawRectangle(dx - 1, by - 3, 3, bh + 6, WHITE);
+    DrawText("demand", dx - 16, by + bh + 4, 8, WHITE);
+    DrawText(TextFormat("roofs %.1f   solar farm %.1f   wind %.1f   backup %.1f  MW", roofSolarKW / 1000.0f, farmSolarKW / 1000.0f, windKW / 1000.0f, gridImportKW / 1000.0f), bx, y0 + 38, 10, LIGHTGRAY);
+    DrawText(TextFormat("Battery %.0f%%   Renewable %.0f%%   Solar roofs %d", batteryPct, renewPct, solarRoofs), bx, y0 + 50, 10, (Color){ 150, 235, 180, 255 });
+
+    int cx = x0 + 470;
+    DrawText(TextFormat("Drones aloft: %d  (police %d / fire %d / medic %d)   sorties %d", out, dP, dF, dM, droneSorties), cx, y0 + 8, 10, SKYBLUE);
+    DrawText(TextFormat("Traffic monitors: %d re-routes, avg speed %.2f", reroutes, avgSpeed), cx, y0 + 22, 10, (Color){ 120, 220, 255, 255 });
+    DrawText(TextFormat("Medical: response %.1fs, to hospital %.1fs", resp, trans), cx, y0 + 36, 10, (Color){ 255, 150, 150, 255 });
+    DrawText(TextFormat("Recycled %.0f t   landfilled %.0f t   AQI %.0f", recycledT, wasteT, st.aqi), cx, y0 + 50, 10, (Color){ 130, 230, 150, 255 });
 }
 
 // Convert physical fullscreen mouse coordinates to the original UI layout.
@@ -3292,6 +4445,7 @@ static Vector2 GetScaledMouse(void) {
 static void HandleInput(float dt) {
     for (int i = 0; i < L_COUNT; i++) if (IsKeyPressed(KEY_ONE + i)) layerOn[i] = !layerOn[i];
     if (IsKeyPressed(KEY_V)) viewMode = (viewMode == VIEW_2D) ? VIEW_3D : VIEW_2D;
+    if (IsKeyPressed(KEY_T)) ToggleSmartCity();
     if (IsKeyPressed(KEY_SPACE)) { rainTimer = 30.0f; rainPeak = 1.0f; }
     if (IsKeyPressed(KEY_P)) paused = !paused;
     if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) simSpeed = fminf(4.0f, simSpeed * 2.0f);
@@ -3301,6 +4455,7 @@ static void HandleInput(float dt) {
     Vector2 m = GetScaledMouse();
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         if (CheckCollisionPointRec(m, ViewBtnRect())) viewMode = (viewMode == VIEW_2D) ? VIEW_3D : VIEW_2D;
+        if (CheckCollisionPointRec(m, SmartBtnRect())) ToggleSmartCity();
         for (int i = 0; i < L_COUNT; i++) if (CheckCollisionPointRec(m, LayerRect(i))) layerOn[i] = !layerOn[i];
     }
 
@@ -3311,7 +4466,12 @@ static void HandleInput(float dt) {
         Vector2 lm = { m.x - PANEL_W, m.y };
         int tx = 0, ty = 0;
         bool ok;
-        if (viewMode == VIEW_2D) { tx = (int)(lm.x / TILE); ty = (int)(lm.y / TILE); ok = true; }
+        if (viewMode == VIEW_2D) {
+            float z = View2DZoom();
+            float wx = lm.x / z, wy = (lm.y - View2DOffY()) / z;
+            ok = (wx >= 0.0f && wy >= 0.0f);
+            tx = (int)(wx / TILE); ty = (int)(wy / TILE);
+        }
         else ok = PickTile3D(lm, &tx, &ty);
         if (ok && InBounds(tx, ty)) {
             hoverOK = true; hoverX = tx; hoverY = ty;
@@ -3353,7 +4513,13 @@ int main(void) {
         // Map view is rendered to a texture so 2D and 3D share the same clipped area
         BeginTextureMode(view);
             if (viewMode == VIEW_2D) {
-                DrawScene2D();
+                ClearBackground(smartCity ? (Color){ 26, 32, 28, 255 } : COL_GRASS);
+                if (smartCity) {
+                    Camera2D cam2 = { (Vector2){ 0.0f, View2DOffY() }, (Vector2){ 0.0f, 0.0f }, 0.0f, View2DZoom() };
+                    BeginMode2D(cam2);
+                        DrawScene2D();
+                    EndMode2D();
+                } else DrawScene2D();
             } else {
                 ClearBackground((Color){ 135, 190, 230, 255 });
                 BeginMode3D(BuildCamera());
@@ -3366,15 +4532,16 @@ int main(void) {
         BeginTextureMode(screen);
             ClearBackground(BLACK);
             DrawTextureRec(view.texture, (Rectangle){ 0, 0, (float)VIEW_W, -(float)VIEW_H }, (Vector2){ PANEL_W, 0 }, WHITE);
+            DrawStatusStrip();
             DrawLeftPanel();
             DrawRightPanel();
             if (layerOn[L_HEAT]) {
-                DrawRectangle(PANEL_W + 6, SCREEN_H - 36, 210, 14, Fade(BLACK, 0.6f));
-                DrawText("Heat map: blue = cool, red = hot", PANEL_W + 10, SCREEN_H - 33, 10, WHITE);
+                DrawRectangle(PANEL_W + 6, VIEW_H - 36, 210, 14, Fade(BLACK, 0.6f));
+                DrawText("Heat map: blue = cool, red = hot", PANEL_W + 10, VIEW_H - 33, 10, WHITE);
             }
             if (layerOn[L_POLLUTION]) {
-                DrawRectangle(PANEL_W + 6, SCREEN_H - 20, 240, 14, Fade(BLACK, 0.6f));
-                DrawText("Pollution map: green = clean, purple = dirty", PANEL_W + 10, SCREEN_H - 17, 10, WHITE);
+                DrawRectangle(PANEL_W + 6, VIEW_H - 20, 240, 14, Fade(BLACK, 0.6f));
+                DrawText("Pollution map: green = clean, purple = dirty", PANEL_W + 10, VIEW_H - 17, 10, WHITE);
             }
             if (paused) DrawText("PAUSED", PANEL_W + VIEW_W / 2 - 40, 10, 20, YELLOW);
         EndTextureMode();
