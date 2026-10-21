@@ -798,17 +798,31 @@ static void FreeTextures(void) { for (int i = 0; i < TX_COUNT; i++) UnloadTextur
 #define V3(X, Y, Z) ((Vector3){ (X), (Y), (Z) })
 // house and storey dimensions (tile units): one set of numbers drives walls, roof, garage and collisions
 #define FLOOR_H  0.115f          // height of one storey (tile units), used by buildings and living walls
-#define HS_CX   -0.05f          // body centre
-#define HS_CZ   -0.08f
-#define HS_W     0.40f          // body width (X)
-#define HS_L     0.36f          // body depth (Z)
-#define HS_WH    0.23f          // wall height
-#define HS_RH    0.12f          // roof rise
-#define HS_GX    0.265f         // garage centre
-#define HS_GZ   -0.05f
-#define HS_GW    0.18f
-#define HS_GL    0.26f
+// Local frame of a house: origin = tile centre, +Z = the way the front door faces, +X = (DY,-DX) of that direction.
+// Fenced compounds: the fence runs on a line FENCE_LINE from the tile centre, so everything in the yard stays inside it.
+#define FENCE_LINE 0.44f         // fence stands 0.06 in from the tile edge
+#define HS_CX   -0.10f          // body centre
+#define HS_CZ   -0.10f
+#define HS_W     0.46f          // body width (X)
+#define HS_L     0.40f          // body depth (Z)
+#define HS_WH    0.26f          // wall height
+#define HS_RH    0.14f          // roof rise
+#define HS_GX    0.27f          // garage centre (also the driveway / parked car, x)
+#define HS_GZ   -0.02f
+#define HS_GW    0.22f
+#define HS_GL    0.28f
 #define HS_GH    0.15f
+#define HS_DRV_Z 0.28f          // parked car centre along the front (Z)
+#define HS_GATE_X  0.22f        // gateway in the front fence: centre (local X) ...
+#define HS_GATE_HW 0.18f        // ... and half width
+// does this house's front door face a community fence? (then the fence gets a gateway for it)
+static bool HouseGateEdge(int x, int y) {
+    if (surface[y][x] != T_HOUSE) return false;
+    int z = zone[y][x];
+    if (z < Z_GATED1 || z > Z_GATED3) return false;
+    int d = faceDir[y][x], nx = x + DX[d], ny = y + DY[d];
+    return !(InBounds(nx, ny) && zone[ny][nx] == z);
+}
 
 typedef struct { float x, y, z, u, v; unsigned char r, g, b, a; } GVert;
 typedef struct { GVert *v; int n, cap; } GBuf;
@@ -3168,12 +3182,16 @@ static bool FpSolid(float px, float pz) {
             break;
     }
     int z = zone[ty][tx];
-    if (z >= Z_GATED1 && z <= Z_LANDFILL) {                    // fenced compounds: the fence stands 0.17 in from the tile edge
+    if (z >= Z_GATED1 && z <= Z_LANDFILL) {                    // fenced compounds: the fence stands FENCE_LINE from the tile centre
         for (int d = 0; d < 4; d++) {
             int nx = tx + DX[d], ny = ty + DY[d];
             if (InBounds(nx, ny) && zone[ny][nx] == z) continue;
             float along = dx * DX[d] + dz * DY[d];
-            if (along <= 0.33f) continue;
+            if (along <= FENCE_LINE) continue;
+            if (HouseGateEdge(tx, ty) && d == faceDir[ty][tx]) {                       // a house's own gateway (local X = (DY,-DX))
+                float lxT = dx * DY[d] - dz * DX[d];
+                if (fabsf(lxT - HS_GATE_X) < HS_GATE_HW) continue;
+            }
             bool gate = gateTile[ty][tx] && IsRoad(nx, ny);
             float perp = fabsf(dx * (float)abs(DY[d]) + dz * (float)abs(DX[d]));
             if (!(gate && perp < 0.22f)) return true;
@@ -3314,7 +3332,7 @@ static bool FpFindCar(FpCand *best) {
             } else if (surface[y][x] == T_HOUSE && drive[y][x]) {
                 int type = drive[y][x] - 1;
                 float th = FaceYaw(faceDir[y][x]), r = th * DEG2RAD;
-                float vx = x + 0.5f + 0.26f * cosf(r) + 0.30f * sinf(r), vz = y + 0.5f - 0.26f * sinf(r) + 0.30f * cosf(r);
+                float vx = x + 0.5f + HS_GX * cosf(r) + HS_DRV_Z * sinf(r), vz = y + 0.5f - HS_GX * sinf(r) + HS_DRV_Z * cosf(r);
                 float d = DistToVeh(fp.x, fp.z, vx, vz, th, VLEN[type], VWID[type]);
                 if (d < best->d) { best->d = d; best->src = 2; best->x = x; best->y = y; best->px = vx; best->pz = vz; best->yaw = th; best->type = type; best->col = drvCol[y][x]; }
             }
@@ -4893,22 +4911,25 @@ static void DrawHouse3D(int x, int y) {
     BoxC(HS_CX - 0.19f, 0.13f, zf, 0.06f, 0.06f, 0.006f, A(win));
     BoxC(HS_CX - HS_W * 0.5f - 0.0025f, 0.13f, HS_CZ - 0.04f, 0.006f, 0.06f, 0.08f, A(win));    // side window
 
-    // driveway, garden path, garden (the parked car is drawn live, see DrawHouseDrive3D)
-    BoxC(HS_GX, 0.006f, 0.30f, 0.15f, 0.012f, 0.42f, A((Color){ 165, 165, 168, 255 }));
-    BoxC(-0.22f, 0.004f, 0.30f, 0.07f, 0.008f, 0.38f, A((Color){ 205, 195, 175, 255 }));      // garden path
-    GSphere(V3(-0.36f, 0.04f, 0.26f), 0.05f, A((Color){ 48, 125, 55, 255 }));
-    GSphere(V3(-0.30f, 0.035f, 0.40f), 0.04f, A((Color){ 62, 145, 62, 255 }));
+    // driveway, garden path, garden (the parked car is drawn live, see DrawHouseDrive3D). Everything stays
+    // inside FENCE_LINE, so a house on the community edge never reaches its fence.
+    BoxC(HS_GX, 0.006f, 0.28f, 0.16f, 0.012f, 0.32f, A((Color){ 165, 165, 168, 255 }));       // drive: garage front to fence
+    float pz0 = HS_CZ + HS_L * 0.5f;                                                          // front wall
+    BoxC(HS_CX - 0.08f, 0.004f, pz0 + 0.10f, 0.07f, 0.008f, 0.20f, A((Color){ 205, 195, 175, 255 }));   // path: door to the gateway
+    BoxC(-0.04f, 0.004f, 0.30f, 0.28f, 0.008f, 0.07f, A((Color){ 205, 195, 175, 255 }));
+    GSphere(V3(-0.36f, 0.04f, 0.22f), 0.05f, A((Color){ 48, 125, 55, 255 }));
+    GSphere(V3(-0.30f, 0.035f, 0.36f), 0.04f, A((Color){ 62, 145, 62, 255 }));
     for (int k = 0; k < 4; k++)
-        GSphere(V3(-0.42f + k * 0.045f, 0.022f, 0.12f), 0.014f, A(k & 1 ? (Color){ 240, 90, 120, 255 } : (Color){ 250, 215, 70, 255 }));
+        GSphere(V3(-0.40f + k * 0.042f, 0.022f, 0.15f), 0.014f, A(k & 1 ? (Color){ 240, 90, 120, 255 } : (Color){ 250, 215, 70, 255 }));
     if (v & 2) {          // back garden tree
-        BoxT(TX_BARK, -0.30f, 0.07f, -0.36f, 0.04f, 0.14f, 0.04f, A(WHITE));
-        GSphere(V3(-0.30f, 0.20f, -0.36f), 0.11f, A((Color){ 55, 140, 55, 255 }));
+        BoxT(TX_BARK, 0.06f, 0.07f, -0.35f, 0.04f, 0.14f, 0.04f, A(WHITE));
+        GSphere(V3(0.06f, 0.20f, -0.35f), 0.07f, A((Color){ 55, 140, 55, 255 }));
     } else if (v & 32) {  // swimming pool
-        BoxC(-0.12f, 0.004f, -0.36f, 0.26f, 0.008f, 0.17f, A((Color){ 225, 225, 225, 255 }));
-        BoxC(-0.12f, 0.009f, -0.36f, 0.22f, 0.006f, 0.13f, A((Color){ 70, 165, 220, 255 }));
+        BoxC(-0.20f, 0.004f, -0.35f, 0.16f, 0.008f, 0.07f, A((Color){ 225, 225, 225, 255 }));
+        BoxC(-0.20f, 0.009f, -0.35f, 0.14f, 0.006f, 0.05f, A((Color){ 70, 165, 220, 255 }));
     }
-    if (v & 16) BoxT(TX_CORRUG, 0.36f, 0.04f, -0.40f, 0.10f, 0.08f, 0.09f, A(WHITE));       // shed
-    BoxT(TX_HEDGE, 0, 0.035f, -0.47f, 0.90f, 0.07f, 0.05f, A(WHITE));                       // back hedge
+    if (v & 16) BoxT(TX_CORRUG, 0.30f, 0.04f, -0.34f, 0.10f, 0.08f, 0.09f, A(WHITE));       // shed
+    BoxT(TX_HEDGE, 0, 0.035f, -0.41f, 0.80f, 0.07f, 0.05f, A(WHITE));                       // back hedge
     PopFrame();
 }
 
@@ -4916,7 +4937,7 @@ static void DrawHouse3D(int x, int y) {
 static void DrawHouseDrive3D(int x, int y) {
     if (!drive[y][x] || surface[y][x] != T_HOUSE) return;
     PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(faceDir[y][x]));
-    PushFrame(HS_GX, 0.008f, 0.30f, 0.0f);
+    PushFrame(HS_GX, 0.008f, HS_DRV_Z, 0.0f);
     DrawVehicleLocal(drive[y][x] - 1, CAR_COLS[drvCol[y][x]], false, NightNow());
     PopFrame();
     PopFrame();
@@ -5111,7 +5132,7 @@ static void DrawLandfillMounds3D(int x, int y) {
     float cx = x + 0.5f, cz = y + 0.5f;
     for (int k = 0; k < 3; k++) {
         float r = 0.12f + 0.04f * ((v >> k) & 3);                  // 0.12 .. 0.24 tile
-        float lim = 0.30f - r;                                    // fence stands at 0.33 from the tile centre
+        float lim = FENCE_LINE - 0.07f - r;                       // fence stands at FENCE_LINE from the tile centre
         float ox = (((v >> (k * 2)) & 3) - 1.5f) * 0.20f, oz = (((v >> (k + 3)) & 3) - 1.5f) * 0.20f;
         ox = Clamp(ox, -lim, lim); oz = Clamp(oz, -lim, lim);
         float hh = bHeight[y][x] * fillK * (0.8f + 0.25f * k);
@@ -5208,16 +5229,50 @@ static void DrawStructureLive3D(int x, int y) {
 // ---------------------------------------------------------------------------
 // 3D drawing - fences, gates, traffic lights, junction furniture
 // ---------------------------------------------------------------------------
-// fence segments: each edge runs on its own line 0.17 in from the tile edge. An end that meets a
+// fence segments: each edge runs on its own line FENCE_LINE from the tile centre. An end that meets a
 // fence on the same line runs to the tile edge; an end at a corner stops at the corner, so the
 // segments meet and never run through each other.
 static float FenceEnd(int x, int y, int z, int d, int sgn) {
     int tx = DY[d] * sgn, ty = -DX[d] * sgn;                       // tangent (local +x is (DY,-DX))
     int nx = x + tx, ny = y + ty;
-    if (!InBounds(nx, ny) || zone[ny][nx] != z) return 0.33f;      // corner or free end
+    if (!InBounds(nx, ny) || zone[ny][nx] != z) return FENCE_LINE; // corner or free end
     int ox = nx + DX[d], oy = ny + DY[d];
     bool sameLine = !(InBounds(ox, oy) && zone[oy][ox] == z);      // the neighbour's own edge on this side is fenced too
-    return sameLine ? 0.5f : 0.33f;
+    return sameLine ? 0.5f : FENCE_LINE;
+}
+// one straight run of fence along the edge, from local x = xa to xb
+static void DrawFenceRun(float xa, float xb, bool picket) {
+    float len = xb - xa, xc = 0.5f * (xa + xb);
+    if (len <= 0.005f) return;
+    const float inset = FENCE_LINE;
+    if (picket) {
+        int n = (int)(len / 0.11f + 0.5f); if (n < 2) n = 2;
+        BoxC(xc, 0.070f, inset, len, 0.012f, 0.010f, A(WHITE));
+        BoxC(xc, 0.130f, inset, len, 0.012f, 0.010f, A(WHITE));
+        for (int k = 0; k < n; k++) BoxC(xa + k * len / (n - 1), 0.080f, inset, 0.022f, 0.16f, 0.010f, A((Color){ 248, 248, 244, 255 }));
+    } else {
+        Color post = A((Color){ 90, 94, 100, 255 });
+        BoxC(xa, 0.11f, inset, 0.016f, 0.22f, 0.016f, post);
+        BoxC(xb, 0.11f, inset, 0.016f, 0.22f, 0.016f, post);
+        BoxC(xc, 0.11f, inset, 0.016f, 0.22f, 0.016f, post);
+        BoxC(xc, 0.115f, inset, len, 0.19f, 0.004f, A((Color){ 175, 180, 188, 150 }));           // panel
+        BoxC(xc, 0.225f, inset, len, 0.008f, 0.008f, post);                                      // top rail
+        BoxC(xc, 0.232f, inset, len, 0.004f, 0.004f, A((Color){ 60, 60, 64, 255 }));
+    }
+}
+// a gateway into a house's front yard: brick piers either side, a lintel, and the leaves folded back flat
+static void DrawHouseGateway(bool picket) {
+    const float inset = FENCE_LINE;
+    float g0 = HS_GATE_X - HS_GATE_HW, g1 = HS_GATE_X + HS_GATE_HW;
+    Color cap = A((Color){ 150, 140, 125, 255 }), leaf = picket ? A((Color){ 246, 246, 240, 255 }) : A((Color){ 120, 124, 130, 255 });
+    for (int s = -1; s <= 1; s += 2) {
+        float px = (s < 0) ? g0 - 0.035f : g1 + 0.035f;
+        BoxT(TX_BRICK, px, 0.13f, inset, 0.07f, 0.26f, 0.07f, A(WHITE));
+        BoxC(px, 0.265f, inset, 0.09f, 0.02f, 0.09f, cap);
+        if (NightNow()) GSphere(V3(px, 0.29f, inset), 0.018f, (Color){ 255, 235, 160, 255 });
+        BoxC((s < 0) ? g0 + 0.03f : g1 - 0.03f, 0.10f, inset - 0.004f, 0.06f, 0.20f, 0.008f, leaf);     // leaf folded back against the pier
+    }
+    BoxC(HS_GATE_X, 0.25f, inset, g1 - g0 + 0.07f, 0.02f, 0.012f, cap);                                 // lintel
 }
 static void DrawFences3D(void) {
     for (int y = 0; y < MAP_H; y++)
@@ -5229,7 +5284,7 @@ static void DrawFences3D(void) {
                 int nx = x + DX[d], ny = y + DY[d];
                 if (InBounds(nx, ny) && zone[ny][nx] == z) continue;
                 bool gate = gateTile[y][x] && IsRoad(nx, ny);
-                float inset = 0.33f;
+                float inset = FENCE_LINE;
                 PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(d));
                 if (gate) {
                     Color pil = A((Color){ 150, 140, 125, 255 });
@@ -5242,21 +5297,11 @@ static void DrawFences3D(void) {
                     BoxC(0.0f, 0.03f, inset, 0.01f, 0.06f, 0.01f, A(DARKGRAY));                                    // barrier post (arm is live)
                 } else {
                     float eL = FenceEnd(x, y, z, d, -1), eR = FenceEnd(x, y, z, d, 1);
-                    float len = eL + eR, xc = (eR - eL) * 0.5f;
-                    if (picket) {
-                        int n = (int)(len / 0.11f + 0.5f); if (n < 2) n = 2;
-                        BoxC(xc, 0.070f, inset, len, 0.012f, 0.010f, A(WHITE));
-                        BoxC(xc, 0.130f, inset, len, 0.012f, 0.010f, A(WHITE));
-                        for (int k = 0; k < n; k++) BoxC(-eL + k * len / (n - 1), 0.080f, inset, 0.022f, 0.16f, 0.010f, A((Color){ 248, 248, 244, 255 }));
-                    } else {
-                        Color post = A((Color){ 90, 94, 100, 255 });
-                        BoxC(-eL, 0.11f, inset, 0.016f, 0.22f, 0.016f, post);
-                        BoxC( eR, 0.11f, inset, 0.016f, 0.22f, 0.016f, post);
-                        BoxC(xc, 0.11f, inset, 0.016f, 0.22f, 0.016f, post);
-                        BoxC(xc, 0.115f, inset, len, 0.19f, 0.004f, A((Color){ 175, 180, 188, 150 }));           // panel
-                        BoxC(xc, 0.225f, inset, len, 0.008f, 0.008f, post);                                      // top rail
-                        BoxC(xc, 0.232f, inset, len, 0.004f, 0.004f, A((Color){ 60, 60, 64, 255 }));
-                    }
+                    if (HouseGateEdge(x, y) && d == faceDir[y][x]) {       // this house's front door faces the fence: leave a gateway
+                        DrawFenceRun(-eL, HS_GATE_X - HS_GATE_HW, picket);
+                        DrawFenceRun(HS_GATE_X + HS_GATE_HW, eR, picket);
+                        DrawHouseGateway(picket);
+                    } else DrawFenceRun(-eL, eR, picket);
                 }
                 PopFrame();
             }
@@ -5273,7 +5318,7 @@ static void DrawFencesLive3D(void) {
                 int nx = x + DX[d], ny = y + DY[d];
                 if (!(InBounds(nx, ny) && zone[ny][nx] != z && IsRoad(nx, ny))) continue;
                 PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(d));
-                float inset = 0.33f;
+                float inset = FENCE_LINE;
                 for (int s = -1; s <= 1; s += 2)
                     if (NightNow()) GSphere(V3(s * 0.30f, 0.23f, inset), 0.018f, (Color){ 255, 235, 160, 255 });
                 BoxC(0.0f, 0.05f, inset, 0.50f, 0.01f, 0.01f, A(((int)(GetTime() * 1.0) % 2) ? RED : WHITE));   // barrier arm
