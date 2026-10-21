@@ -578,23 +578,24 @@ static const float UC_CABIN[V_COUNT][3] = {
 
 static bool FpActive(void) { return viewMode == VIEW_FP; }
 
-// Traffic awareness: a car heading (dxv,dyv) is held up by the walking player or by any parked / driven car in front of it.
-static bool FpBlocksLane(const Car *c, float dxv, float dyv, float *gapOut) {
-    if (fp.valid && FpActive() && (fp.state == FP_WALK || fp.state == FP_ENTER)) {
-        float rx = fp.x - c->x, ry = fp.z - c->y;
-        float along = rx * dxv + ry * dyv, side = fabsf(-rx * dyv + ry * dxv);
-        if (along > 0.02f && along < 0.5f * VLEN[c->type] + 0.10f && side < 0.10f) { if (gapOut) *gapOut = along; return true; }
+// exact overlap test for two vehicles (oriented rectangles on the ground plane, yaw in degrees, forward = (sin yaw, cos yaw))
+static bool VehOverlap(float x1, float z1, float yaw1, float L1, float W1, float x2, float z2, float yaw2, float L2, float W2) {
+    const float m = 0.004f;                                        // small clearance
+    float t1 = yaw1 * DEG2RAD, t2 = yaw2 * DEG2RAD;
+    float fx[2] = { sinf(t1), sinf(t2) }, fz[2] = { cosf(t1), cosf(t2) };
+    float halfL[2] = { 0.5f * L1, 0.5f * L2 }, halfW[2] = { 0.5f * W1, 0.5f * W2 };
+    float dx = x2 - x1, dz = z2 - z1;
+    for (int a = 0; a < 4; a++) {                                  // separating axes: forward and right of each box
+        int b = a >> 1;
+        float nx = (a & 1) ? fz[b] : fx[b], nz = (a & 1) ? -fx[b] : fz[b];
+        float dist = fabsf(dx * nx + dz * nz);
+        float r1 = halfL[0] * fabsf(fx[0] * nx + fz[0] * nz) + halfW[0] * fabsf(fz[0] * nx - fx[0] * nz);
+        float r2 = halfL[1] * fabsf(fx[1] * nx + fz[1] * nz) + halfW[1] * fabsf(fz[1] * nx - fx[1] * nz);
+        if (dist > r1 + r2 + m) return false;
     }
-    for (int i = 0; i < MAX_UCARS; i++) {
-        const UCar *u = &ucars[i];
-        if (!u->active) continue;
-        float rx = u->x - c->x, ry = u->z - c->y;
-        float along = rx * dxv + ry * dyv, side = fabsf(-rx * dyv + ry * dxv);
-        float need = 0.5f * (VLEN[c->type] + VLEN[u->type]) + 0.07f;
-        if (along > 0.02f && along < need && side < 0.10f) { if (gapOut) *gapOut = along; return true; }
-    }
-    return false;
+    return true;
 }
+
 
 // ---------------------------------------------------------------------------
 // Procedural textures (no image files needed) + 3D primitive helpers
@@ -788,73 +789,102 @@ static void MakeTextures(void) {
 
 static void FreeTextures(void) { for (int i = 0; i < TX_COUNT; i++) UnloadTexture(tex[i]); }
 
-// ---- 3D primitives (all coordinates are local to the current transform) ----
-static void SetShade(Color c, float k) {
-    rlColor4ub((unsigned char)(c.r * k), (unsigned char)(c.g * k), (unsigned char)(c.b * k), c.a);
+// ---- 3D geometry layer ----------------------------------------------------------------
+// Every 3D primitive writes world-space triangles into a bucket per texture (opaque or transparent).
+// The transform stack uses the same maths as rlgl but runs on the CPU, so the static city is baked
+// into a few GPU meshes once, and the moving parts are batched each frame (see DrawScene3D).
+#define GB_NONE   TX_COUNT                        // bucket for untextured geometry
+#define GB_SLOTS  (TX_COUNT + 1)
+#define V3(X, Y, Z) ((Vector3){ (X), (Y), (Z) })
+// house and storey dimensions (tile units): one set of numbers drives walls, roof, garage and collisions
+#define FLOOR_H  0.115f          // height of one storey (tile units), used by buildings and living walls
+#define HS_CX   -0.05f          // body centre
+#define HS_CZ   -0.08f
+#define HS_W     0.40f          // body width (X)
+#define HS_L     0.36f          // body depth (Z)
+#define HS_WH    0.23f          // wall height
+#define HS_RH    0.12f          // roof rise
+#define HS_GX    0.265f         // garage centre
+#define HS_GZ   -0.05f
+#define HS_GW    0.18f
+#define HS_GL    0.26f
+#define HS_GH    0.15f
+
+typedef struct { float x, y, z, u, v; unsigned char r, g, b, a; } GVert;
+typedef struct { GVert *v; int n, cap; } GBuf;
+
+static unsigned int gSceneGen = 0;                 // bumped whenever the city is regenerated (forces a rebake)
+static GBuf     gBuf[GB_SLOTS][2];                // [texture slot][0 = opaque, 1 = transparent]
+static Mesh     gMesh[GB_SLOTS][2];               // baked static scenery
+static bool     gHasMesh[GB_SLOTS][2];
+static Material gMat[GB_SLOTS];
+static bool     gMatsReady = false;
+static Matrix   gM;                               // current transform: world = gM * local
+static Matrix   gMStack[48];
+static int      gMSP = 0;
+
+static void GXReset(void) { gM = MatrixIdentity(); gMSP = 0; }
+static void GXPush(void)  { if (gMSP < 48) gMStack[gMSP++] = gM; }
+static void GXPop(void)   { if (gMSP > 0) gM = gMStack[--gMSP]; }
+static void GXTrans(float x, float y, float z) { gM = MatrixMultiply(MatrixTranslate(x, y, z), gM); }
+static void GXRot(float deg, float ax, float ay, float az) { gM = MatrixMultiply(MatrixRotate((Vector3){ ax, ay, az }, deg * DEG2RAD), gM); }
+static void GXScale(float x, float y, float z) { gM = MatrixMultiply(MatrixScale(x, y, z), gM); }
+
+static Color ShadeF(Color c, float k) { return (Color){ (unsigned char)(c.r * k), (unsigned char)(c.g * k), (unsigned char)(c.b * k), c.a }; }
+
+static GVert GV(Vector3 p, float u, float v, Color c) {
+    Vector3 q = Vector3Transform(p, gM);
+    GVert r = { q.x, q.y, q.z, u, v, c.r, c.g, c.b, c.a };
+    return r;
 }
-// Untextured box with simple per-face shading (top lightest, one side darkest)
+static GBuf *GBufOf(int ti, Color c) { return &gBuf[ti < 0 ? GB_NONE : ti][c.a < 255 ? 1 : 0]; }
+static void GAdd(GBuf *b, GVert a) {
+    if (b->n == b->cap) { b->cap = b->cap ? b->cap * 2 : 8192; b->v = (GVert *)realloc(b->v, (size_t)b->cap * sizeof(GVert)); }
+    b->v[b->n++] = a;
+}
+// quad p[0..3] in order (two triangles); uv = 8 floats or NULL
+static void GQuad(int ti, const Vector3 *p, const float *uv, Color c) {
+    static const float zero[8] = { 0 };
+    const float *t = uv ? uv : zero;
+    GBuf *g = GBufOf(ti, c);
+    GVert A = GV(p[0], t[0], t[1], c), B = GV(p[1], t[2], t[3], c), C = GV(p[2], t[4], t[5], c), D = GV(p[3], t[6], t[7], c);
+    GAdd(g, A); GAdd(g, B); GAdd(g, C);
+    GAdd(g, A); GAdd(g, C); GAdd(g, D);
+}
+// triangle p[0..2]; uv = 6 floats or NULL
+static void GTri(int ti, const Vector3 *p, const float *uv, Color c) {
+    static const float zero[6] = { 0 };
+    const float *t = uv ? uv : zero;
+    GBuf *g = GBufOf(ti, c);
+    GAdd(g, GV(p[0], t[0], t[1], c)); GAdd(g, GV(p[1], t[2], t[3], c)); GAdd(g, GV(p[2], t[4], t[5], c));
+}
+
+// Box with simple per-face shading (top lightest, one side darkest)
 static void BoxC(float x, float y, float z, float w, float h, float l, Color c) {
     float a = w * 0.5f, b = h * 0.5f, d = l * 0.5f;
-    rlSetTexture(0);
-    rlBegin(RL_QUADS);
-    SetShade(c, 0.90f);
-    rlVertex3f(x - a, y - b, z + d); rlVertex3f(x + a, y - b, z + d); rlVertex3f(x + a, y + b, z + d); rlVertex3f(x - a, y + b, z + d);
-    SetShade(c, 0.78f);
-    rlVertex3f(x - a, y - b, z - d); rlVertex3f(x - a, y + b, z - d); rlVertex3f(x + a, y + b, z - d); rlVertex3f(x + a, y - b, z - d);
-    SetShade(c, 1.00f);
-    rlVertex3f(x - a, y + b, z - d); rlVertex3f(x - a, y + b, z + d); rlVertex3f(x + a, y + b, z + d); rlVertex3f(x + a, y + b, z - d);
-    SetShade(c, 0.50f);
-    rlVertex3f(x - a, y - b, z - d); rlVertex3f(x + a, y - b, z - d); rlVertex3f(x + a, y - b, z + d); rlVertex3f(x - a, y - b, z + d);
-    SetShade(c, 0.84f);
-    rlVertex3f(x + a, y - b, z - d); rlVertex3f(x + a, y + b, z - d); rlVertex3f(x + a, y + b, z + d); rlVertex3f(x + a, y - b, z + d);
-    SetShade(c, 0.72f);
-    rlVertex3f(x - a, y - b, z - d); rlVertex3f(x - a, y - b, z + d); rlVertex3f(x - a, y + b, z + d); rlVertex3f(x - a, y + b, z - d);
-    rlEnd();
+    GQuad(-1, (Vector3[4]){ V3(x - a, y - b, z + d), V3(x + a, y - b, z + d), V3(x + a, y + b, z + d), V3(x - a, y + b, z + d) }, NULL, ShadeF(c, 0.90f));   // front +z
+    GQuad(-1, (Vector3[4]){ V3(x - a, y - b, z - d), V3(x - a, y + b, z - d), V3(x + a, y + b, z - d), V3(x + a, y - b, z - d) }, NULL, ShadeF(c, 0.78f));   // back -z
+    GQuad(-1, (Vector3[4]){ V3(x - a, y + b, z - d), V3(x - a, y + b, z + d), V3(x + a, y + b, z + d), V3(x + a, y + b, z - d) }, NULL, c);                  // top
+    GQuad(-1, (Vector3[4]){ V3(x - a, y - b, z - d), V3(x + a, y - b, z - d), V3(x + a, y - b, z + d), V3(x - a, y - b, z + d) }, NULL, ShadeF(c, 0.50f));   // bottom
+    GQuad(-1, (Vector3[4]){ V3(x + a, y - b, z - d), V3(x + a, y + b, z - d), V3(x + a, y + b, z + d), V3(x + a, y - b, z + d) }, NULL, ShadeF(c, 0.84f));   // right +x
+    GQuad(-1, (Vector3[4]){ V3(x - a, y - b, z - d), V3(x - a, y - b, z + d), V3(x - a, y + b, z + d), V3(x - a, y + b, z - d) }, NULL, ShadeF(c, 0.72f));   // left -x
 }
 
 // Textured cube; (u, v) are the texture-coordinate extents used on the side faces
 static void CubeUV(int ti, float x, float y, float z, float w, float h, float l, Color c, float u, float v) {
     float a = w * 0.5f, b = h * 0.5f, d = l * 0.5f;
-    rlSetTexture(tex[ti].id);
-    rlBegin(RL_QUADS);
-    // front (+z)
-    SetShade(c, 0.90f);
-    rlTexCoord2f(0, v); rlVertex3f(x - a, y - b, z + d);
-    rlTexCoord2f(u, v); rlVertex3f(x + a, y - b, z + d);
-    rlTexCoord2f(u, 0); rlVertex3f(x + a, y + b, z + d);
-    rlTexCoord2f(0, 0); rlVertex3f(x - a, y + b, z + d);
-    // back (-z)
-    SetShade(c, 0.78f);
-    rlTexCoord2f(u, v); rlVertex3f(x - a, y - b, z - d);
-    rlTexCoord2f(u, 0); rlVertex3f(x - a, y + b, z - d);
-    rlTexCoord2f(0, 0); rlVertex3f(x + a, y + b, z - d);
-    rlTexCoord2f(0, v); rlVertex3f(x + a, y - b, z - d);
-    // top
-    SetShade(c, 1.00f);
-    rlTexCoord2f(0, 1); rlVertex3f(x - a, y + b, z - d);
-    rlTexCoord2f(0, 0); rlVertex3f(x - a, y + b, z + d);
-    rlTexCoord2f(1, 0); rlVertex3f(x + a, y + b, z + d);
-    rlTexCoord2f(1, 1); rlVertex3f(x + a, y + b, z - d);
-    // bottom
-    SetShade(c, 0.50f);
-    rlTexCoord2f(1, 1); rlVertex3f(x - a, y - b, z - d);
-    rlTexCoord2f(0, 1); rlVertex3f(x + a, y - b, z - d);
-    rlTexCoord2f(0, 0); rlVertex3f(x + a, y - b, z + d);
-    rlTexCoord2f(1, 0); rlVertex3f(x - a, y - b, z + d);
-    // right (+x)
-    SetShade(c, 0.84f);
-    rlTexCoord2f(u, v); rlVertex3f(x + a, y - b, z - d);
-    rlTexCoord2f(u, 0); rlVertex3f(x + a, y + b, z - d);
-    rlTexCoord2f(0, 0); rlVertex3f(x + a, y + b, z + d);
-    rlTexCoord2f(0, v); rlVertex3f(x + a, y - b, z + d);
-    // left (-x)
-    SetShade(c, 0.72f);
-    rlTexCoord2f(0, v); rlVertex3f(x - a, y - b, z - d);
-    rlTexCoord2f(u, v); rlVertex3f(x - a, y - b, z + d);
-    rlTexCoord2f(u, 0); rlVertex3f(x - a, y + b, z + d);
-    rlTexCoord2f(0, 0); rlVertex3f(x - a, y + b, z - d);
-    rlEnd();
-    rlSetTexture(0);
+    GQuad(ti, (Vector3[4]){ V3(x - a, y - b, z + d), V3(x + a, y - b, z + d), V3(x + a, y + b, z + d), V3(x - a, y + b, z + d) },
+          (float[8]){ 0, v, u, v, u, 0, 0, 0 }, ShadeF(c, 0.90f));                                   // front
+    GQuad(ti, (Vector3[4]){ V3(x - a, y - b, z - d), V3(x - a, y + b, z - d), V3(x + a, y + b, z - d), V3(x + a, y - b, z - d) },
+          (float[8]){ u, v, u, 0, 0, 0, 0, v }, ShadeF(c, 0.78f));                                   // back
+    GQuad(ti, (Vector3[4]){ V3(x - a, y + b, z - d), V3(x - a, y + b, z + d), V3(x + a, y + b, z + d), V3(x + a, y + b, z - d) },
+          (float[8]){ 0, 1, 0, 0, 1, 0, 1, 1 }, c);                                                  // top
+    GQuad(ti, (Vector3[4]){ V3(x - a, y - b, z - d), V3(x + a, y - b, z - d), V3(x + a, y - b, z + d), V3(x - a, y - b, z + d) },
+          (float[8]){ 1, 1, 0, 1, 0, 0, 1, 0 }, ShadeF(c, 0.50f));                                   // bottom
+    GQuad(ti, (Vector3[4]){ V3(x + a, y - b, z - d), V3(x + a, y + b, z - d), V3(x + a, y + b, z + d), V3(x + a, y - b, z + d) },
+          (float[8]){ u, v, u, 0, 0, 0, 0, v }, ShadeF(c, 0.84f));                                   // right
+    GQuad(ti, (Vector3[4]){ V3(x - a, y - b, z - d), V3(x - a, y - b, z + d), V3(x - a, y + b, z + d), V3(x - a, y + b, z - d) },
+          (float[8]){ 0, v, u, v, u, 0, 0, 0 }, ShadeF(c, 0.72f));                                   // left
 }
 static void BoxT(int ti, float x, float y, float z, float w, float h, float l, Color c) {
     CubeUV(ti, x, y, z, w, h, l, c, 1.0f, 1.0f);
@@ -867,36 +897,28 @@ static void WindowBox(int ti, int floors, float x, float y, float z, float w, fl
 }
 
 static void Quad3T(int ti, Vector3 a, Vector3 b, Vector3 c, Vector3 d, Color col, float u, float v) {
-    rlSetTexture(tex[ti].id);
-    rlBegin(RL_QUADS);
-    rlColor4ub(col.r, col.g, col.b, col.a);
-    rlTexCoord2f(0, 0); rlVertex3f(a.x, a.y, a.z);
-    rlTexCoord2f(0, v); rlVertex3f(b.x, b.y, b.z);
-    rlTexCoord2f(u, v); rlVertex3f(c.x, c.y, c.z);
-    rlTexCoord2f(u, 0); rlVertex3f(d.x, d.y, d.z);
-    rlEnd();
-    rlSetTexture(0);
+    GQuad(ti, (Vector3[4]){ a, b, c, d }, (float[8]){ 0, 0, 0, v, u, v, u, 0 }, col);
 }
 static void Tri3T(int ti, Vector3 a, Vector3 b, Vector3 c, Color col, float u, float v) {
-    rlSetTexture(tex[ti].id);
-    rlBegin(RL_TRIANGLES);
-    rlColor4ub(col.r, col.g, col.b, col.a);
-    rlTexCoord2f(0, 0);        rlVertex3f(a.x, a.y, a.z);
-    rlTexCoord2f(u, 0);        rlVertex3f(b.x, b.y, b.z);
-    rlTexCoord2f(u * 0.5f, v); rlVertex3f(c.x, c.y, c.z);
-    rlEnd();
-    rlSetTexture(0);
+    GTri(ti, (Vector3[3]){ a, b, c }, (float[6]){ 0, 0, u, 0, u * 0.5f, v }, col);
 }
 
-// Gable roof: ridge runs along local Z (alongZ) or local X. Eaves at y0, ridge at y0 + h.
+// Gable roof over a w (X) by l (Z) footprint, eaves at y0, ridge h above. The roof edges are the
+// footprint edges, so it sits flush on the walls. alongZ = ridge runs along Z, else along X.
 static void RoofGable(float w, float l, float y0, float h, bool alongZ, Color roofCol, int wallTex, Color wallCol) {
-    float a = w * 0.5f, b = l * 0.5f;
-    #define RV(p, q, y) (alongZ ? (Vector3){ p, y, q } : (Vector3){ q, y, p })
-    Quad3T(TX_ROOF, RV(-a, -b, y0), RV(-a, b, y0), RV(0, b, y0 + h), RV(0, -b, y0 + h), roofCol, 3, 2);
-    Quad3T(TX_ROOF, RV(a, -b, y0), RV(a, b, y0), RV(0, b, y0 + h), RV(0, -b, y0 + h), Shade(roofCol, 0.82f), 3, 2);
-    Tri3T(wallTex, RV(-a, b, y0), RV(a, b, y0), RV(0, b, y0 + h), wallCol, 1, 1);
-    Tri3T(wallTex, RV(-a, -b, y0), RV(a, -b, y0), RV(0, -b, y0 + h), wallCol, 1, 1);
-    #undef RV
+    float a = w * 0.5f, b = l * 0.5f, yh = y0 + h;
+    Color dark = ShadeF(roofCol, 0.82f);
+    if (alongZ) {
+        Quad3T(TX_ROOF, V3(-a, y0, -b), V3(-a, y0, b), V3(0, yh, b), V3(0, yh, -b), roofCol, 3, 2);
+        Quad3T(TX_ROOF, V3(a, y0, -b), V3(a, y0, b), V3(0, yh, b), V3(0, yh, -b), dark, 3, 2);
+        Tri3T(wallTex, V3(-a, y0, b), V3(a, y0, b), V3(0, yh, b), wallCol, 1, 1);
+        Tri3T(wallTex, V3(-a, y0, -b), V3(a, y0, -b), V3(0, yh, -b), wallCol, 1, 1);
+    } else {
+        Quad3T(TX_ROOF, V3(-a, y0, -b), V3(a, y0, -b), V3(a, yh, 0), V3(-a, yh, 0), roofCol, 3, 2);
+        Quad3T(TX_ROOF, V3(-a, y0, b), V3(a, y0, b), V3(a, yh, 0), V3(-a, yh, 0), dark, 3, 2);
+        Tri3T(wallTex, V3(a, y0, -b), V3(a, y0, b), V3(a, yh, 0), wallCol, 1, 1);
+        Tri3T(wallTex, V3(-a, y0, -b), V3(-a, y0, b), V3(-a, yh, 0), wallCol, 1, 1);
+    }
 }
 
 // Hipped (pyramid) roof
@@ -905,19 +927,142 @@ static void RoofHip(float w, float l, float y0, float h, Color roofCol) {
     Vector3 top = { 0, y0 + h, 0 };
     Vector3 p0 = { -a, y0, -b }, p1 = { a, y0, -b }, p2 = { a, y0, b }, p3 = { -a, y0, b };
     Tri3T(TX_ROOF, p0, p1, top, roofCol, 2, 2);
-    Tri3T(TX_ROOF, p1, p2, top, Shade(roofCol, 0.85f), 2, 2);
+    Tri3T(TX_ROOF, p1, p2, top, ShadeF(roofCol, 0.85f), 2, 2);
     Tri3T(TX_ROOF, p2, p3, top, roofCol, 2, 2);
-    Tri3T(TX_ROOF, p3, p0, top, Shade(roofCol, 0.85f), 2, 2);
+    Tri3T(TX_ROOF, p3, p0, top, ShadeF(roofCol, 0.85f), 2, 2);
 }
 
 // Enter / leave a local frame at tile-space (x,z) with a heading in degrees (local +Z = forward)
 static void PushFrame(float x, float y, float z, float yawDeg) {
-    rlPushMatrix();
-    rlTranslatef(x, y, z);
-    rlRotatef(yawDeg, 0, 1, 0);
+    GXPush();
+    GXTrans(x, y, z);
+    GXRot(yawDeg, 0, 1, 0);
 }
-static void PopFrame(void) { rlPopMatrix(); }
+static void PopFrame(void) { GXPop(); }
 static float FaceYaw(int dir) { return atan2f((float)DX[dir], (float)DY[dir]) * RAD2DEG; }
+
+// ---- solids (replace raylib's DrawSphere / DrawCylinder / DrawCube / DrawPlane; low-poly) ----
+static void GSphereN(Vector3 c, float r, Color col, int sl, int rg) {
+    for (int i = 0; i < rg; i++) {
+        float p0 = PI * i / rg, p1 = PI * (i + 1) / rg;
+        float s0 = sinf(p0), c0 = cosf(p0), s1 = sinf(p1), c1 = cosf(p1);
+        for (int j = 0; j < sl; j++) {
+            float t0 = 2.0f * PI * j / sl, t1 = 2.0f * PI * (j + 1) / sl;
+            float ct0 = cosf(t0), st0 = sinf(t0), ct1 = cosf(t1), st1 = sinf(t1);
+            GQuad(-1, (Vector3[4]){ V3(c.x + r * s0 * ct0, c.y + r * c0, c.z + r * s0 * st0), V3(c.x + r * s0 * ct1, c.y + r * c0, c.z + r * s0 * st1),
+                                    V3(c.x + r * s1 * ct1, c.y + r * c1, c.z + r * s1 * st1), V3(c.x + r * s1 * ct0, c.y + r * c1, c.z + r * s1 * st0) }, NULL, col);
+        }
+    }
+}
+static void GSphere(Vector3 c, float r, Color col) {
+    if (r < 0.02f) GSphereN(c, r, col, 6, 4);
+    else if (r < 0.08f) GSphereN(c, r, col, 8, 6);
+    else GSphereN(c, r, col, 12, 8);
+}
+// cylinder from p0 (radius r0) to p1 (radius r1), any direction
+static void GCylinderEx(Vector3 p0, Vector3 p1, float r0, float r1, int sides, Color col) {
+    Vector3 d = Vector3Subtract(p1, p0);
+    float len = Vector3Length(d);
+    if (len < 1e-6f || sides < 3) return;
+    Vector3 dir = Vector3Scale(d, 1.0f / len);
+    Vector3 ref = fabsf(dir.y) < 0.95f ? V3(0, 1, 0) : V3(1, 0, 0);
+    Vector3 u = Vector3Normalize(Vector3CrossProduct(dir, ref));
+    Vector3 v = Vector3CrossProduct(dir, u);
+    for (int i = 0; i < sides; i++) {
+        float a0 = 2.0f * PI * i / sides, a1 = 2.0f * PI * (i + 1) / sides;
+        Vector3 k0 = Vector3Add(Vector3Scale(u, cosf(a0)), Vector3Scale(v, sinf(a0)));
+        Vector3 k1 = Vector3Add(Vector3Scale(u, cosf(a1)), Vector3Scale(v, sinf(a1)));
+        Vector3 s0 = Vector3Add(p0, Vector3Scale(k0, r0)), s1 = Vector3Add(p0, Vector3Scale(k1, r0));
+        Vector3 e0 = Vector3Add(p1, Vector3Scale(k0, r1)), e1 = Vector3Add(p1, Vector3Scale(k1, r1));
+        GQuad(-1, (Vector3[4]){ s0, s1, e1, e0 }, NULL, col);
+        if (r0 > 0.0f) GTri(-1, (Vector3[3]){ p0, s1, s0 }, NULL, col);
+        if (r1 > 0.0f) GTri(-1, (Vector3[3]){ p1, e0, e1 }, NULL, col);
+    }
+}
+// upright cylinder standing on pos (base radius rb, top radius rt, height h)
+static void GCylinder(Vector3 pos, float rt, float rb, float h, int sides, Color col) {
+    GCylinderEx(pos, V3(pos.x, pos.y + h, pos.z), rb, rt, sides, col);
+}
+static void GCube(Vector3 c, float w, float h, float l, Color col) {        // single colour, no face shading
+    float a = w * 0.5f, b = h * 0.5f, d = l * 0.5f;
+    GQuad(-1, (Vector3[4]){ V3(c.x - a, c.y - b, c.z + d), V3(c.x + a, c.y - b, c.z + d), V3(c.x + a, c.y + b, c.z + d), V3(c.x - a, c.y + b, c.z + d) }, NULL, col);
+    GQuad(-1, (Vector3[4]){ V3(c.x - a, c.y - b, c.z - d), V3(c.x - a, c.y + b, c.z - d), V3(c.x + a, c.y + b, c.z - d), V3(c.x + a, c.y - b, c.z - d) }, NULL, col);
+    GQuad(-1, (Vector3[4]){ V3(c.x - a, c.y + b, c.z - d), V3(c.x - a, c.y + b, c.z + d), V3(c.x + a, c.y + b, c.z + d), V3(c.x + a, c.y + b, c.z - d) }, NULL, col);
+    GQuad(-1, (Vector3[4]){ V3(c.x - a, c.y - b, c.z - d), V3(c.x + a, c.y - b, c.z - d), V3(c.x + a, c.y - b, c.z + d), V3(c.x - a, c.y - b, c.z + d) }, NULL, col);
+    GQuad(-1, (Vector3[4]){ V3(c.x + a, c.y - b, c.z - d), V3(c.x + a, c.y + b, c.z - d), V3(c.x + a, c.y + b, c.z + d), V3(c.x + a, c.y - b, c.z + d) }, NULL, col);
+    GQuad(-1, (Vector3[4]){ V3(c.x - a, c.y - b, c.z - d), V3(c.x - a, c.y - b, c.z + d), V3(c.x - a, c.y + b, c.z + d), V3(c.x - a, c.y + b, c.z - d) }, NULL, col);
+}
+static void GPlane(Vector3 c, Vector2 size, Color col) {                     // flat rectangle on the XZ plane
+    float a = size.x * 0.5f, d = size.y * 0.5f;
+    GQuad(-1, (Vector3[4]){ V3(c.x - a, c.y, c.z - d), V3(c.x - a, c.y, c.z + d), V3(c.x + a, c.y, c.z + d), V3(c.x + a, c.y, c.z - d) }, NULL, col);
+}
+
+// ---- drawing the buckets ----
+static void GBakeStart(void) {
+    for (int s = 0; s < GB_SLOTS; s++) for (int t = 0; t < 2; t++) gBuf[s][t].n = 0;
+    GXReset();
+}
+
+// Upload everything collected since GBakeStart as the static scenery (replaces the previous bake)
+static void GBakeFinish(void) {
+    if (!gMatsReady) {
+        for (int s = 0; s < GB_SLOTS; s++) {
+            gMat[s] = LoadMaterialDefault();
+            if (s != GB_NONE) gMat[s].maps[MATERIAL_MAP_DIFFUSE].texture = tex[s];
+        }
+        gMatsReady = true;
+    }
+    for (int s = 0; s < GB_SLOTS; s++) for (int t = 0; t < 2; t++) {
+        if (gHasMesh[s][t]) { UnloadMesh(gMesh[s][t]); gHasMesh[s][t] = false; }
+        GBuf *g = &gBuf[s][t];
+        if (g->n > 0) {
+            Mesh m = { 0 };
+            m.vertexCount = g->n;
+            m.triangleCount = g->n / 3;
+            m.vertices = (float *)malloc((size_t)g->n * 3 * sizeof(float));
+            m.texcoords = (float *)malloc((size_t)g->n * 2 * sizeof(float));
+            m.colors = (unsigned char *)malloc((size_t)g->n * 4);
+            for (int i = 0; i < g->n; i++) {
+                const GVert *v = &g->v[i];
+                m.vertices[i * 3] = v->x; m.vertices[i * 3 + 1] = v->y; m.vertices[i * 3 + 2] = v->z;
+                m.texcoords[i * 2] = v->u; m.texcoords[i * 2 + 1] = v->v;
+                m.colors[i * 4] = v->r; m.colors[i * 4 + 1] = v->g; m.colors[i * 4 + 2] = v->b; m.colors[i * 4 + 3] = v->a;
+            }
+            UploadMesh(&m, false);
+            free(m.vertices); m.vertices = NULL;          // the GPU holds the data now
+            free(m.texcoords); m.texcoords = NULL;
+            free(m.colors); m.colors = NULL;
+            gMesh[s][t] = m;
+            gHasMesh[s][t] = true;
+        }
+        g->n = 0;
+    }
+}
+
+// Draw the baked scenery of one layer (opaque = 0, transparent = 1)
+static void GDrawBaked(bool trans) {
+    for (int s = 0; s < GB_SLOTS; s++)
+        if (gHasMesh[s][trans]) DrawMesh(gMesh[s][trans], gMat[s], MatrixIdentity());
+}
+
+// Draw the geometry collected since GBakeStart / GBeginLive, batched by texture, and clear it
+static void GFlushLive(bool trans) {
+    for (int s = 0; s < GB_SLOTS; s++) {
+        GBuf *g = &gBuf[s][trans];
+        if (g->n == 0) continue;
+        rlSetTexture(s == GB_NONE ? 0 : tex[s].id);
+        rlBegin(RL_TRIANGLES);
+        for (int i = 0; i < g->n; i++) {
+            const GVert *v = &g->v[i];
+            rlColor4ub(v->r, v->g, v->b, v->a);
+            rlTexCoord2f(v->u, v->v);
+            rlVertex3f(v->x, v->y, v->z);
+        }
+        rlEnd();
+        rlSetTexture(0);
+        g->n = 0;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // City generation
@@ -977,6 +1122,7 @@ static void BuildCommunity(int id, int x0, int y0, int x1, int y1, int laneY, in
 }
 
 static void GenerateCity(void) {
+    gSceneGen++;
     static const int roadRows[3] = { 3, 9, 13 };
     static const int roadCols[3] = { 4, 11, 18 };
     // junction control: [row][col]
@@ -1287,12 +1433,18 @@ static int SpawnCarAt(int x, int y, int type, int colIdx, bool allowRogue) {
     int valid[4], nv = 0;
     for (int d = 0; d < 4; d++) if (IsRoad(x + DX[d], y + DY[d])) valid[nv++] = d;
     if (nv == 0) return -1;
+    int dirPick = valid[GetRandomValue(0, nv - 1)];
+    float spYaw = FaceYaw(dirPick), spL = VLEN[type], spW = VWID[type], spX = x + 0.5f, spY = y + 0.5f;
+    for (int j = 0; j < MAX_CARS; j++)
+        if (cars[j].active && VehOverlap(spX, spY, spYaw, spL, spW, cars[j].x, cars[j].y, cars[j].yaw, VLEN[cars[j].type], VWID[cars[j].type])) return -1;
+    for (int j = 0; j < MAX_UCARS; j++)
+        if (ucars[j].active && VehOverlap(spX, spY, spYaw, spL, spW, ucars[j].x, ucars[j].z, ucars[j].yaw, VLEN[ucars[j].type], VWID[ucars[j].type])) return -1;
     Car *c = &cars[slot];
     memset(c, 0, sizeof(*c));
     c->active = true; c->id = carSerial++;
     c->type = (unsigned char)type; c->colIdx = (unsigned char)colIdx;
     c->col = CAR_COLS[colIdx];
-    c->dir = valid[GetRandomValue(0, nv - 1)];
+    c->dir = dirPick;
     c->gx = c->tx = x; c->gy = c->ty = y; c->t = 1.0f;
     c->x = x + 0.5f; c->y = y + 0.5f; c->yaw = FaceYaw(c->dir);
     c->claimX = c->claimY = -1; c->pursuer = -1; c->destX = c->destY = -1;
@@ -1396,9 +1548,25 @@ static int SmartChoose(Car *c, const int *opts, int no) {
     return bestC;
 }
 
-static bool LaneBlocked(const Car *c, float *gapOut) {
+// Free space ahead of a car before it reaches the minimum following distance of the nearest vehicle or
+// walking player in its lane. Negative = already inside that distance (held up). 99 = nothing ahead.
+static float LaneFreeGap(const Car *c) {
     float dxv = (float)DX[c->dir], dyv = (float)DY[c->dir];
-    if (FpBlocksLane(c, dxv, dyv, gapOut)) return true;
+    float best = 99.0f;
+    if (fp.valid && FpActive() && (fp.state == FP_WALK || fp.state == FP_ENTER)) {
+        float rx = fp.x - c->x, ry = fp.z - c->y;
+        float along = rx * dxv + ry * dyv, side = fabsf(-rx * dyv + ry * dxv);
+        float need = 0.5f * VLEN[c->type] + 0.10f;
+        if (along > 0.02f && side < 0.10f) best = fminf(best, along - need);
+    }
+    for (int i = 0; i < MAX_UCARS; i++) {
+        const UCar *u = &ucars[i];
+        if (!u->active) continue;
+        float rx = u->x - c->x, ry = u->z - c->y;
+        float along = rx * dxv + ry * dyv, side = fabsf(-rx * dyv + ry * dxv);
+        float need = 0.5f * (VLEN[c->type] + VLEN[u->type]) + 0.07f;
+        if (along > 0.02f && side < 0.10f) best = fminf(best, along - need);
+    }
     for (int j = 0; j < MAX_CARS; j++) {
         const Car *o = &cars[j];
         if (o == c || !o->active || o->dir != c->dir || o->arcing) continue;
@@ -1406,14 +1574,72 @@ static bool LaneBlocked(const Car *c, float *gapOut) {
         float along = rx * dxv + ry * dyv;
         float side = fabsf(-rx * dyv + ry * dxv);
         float need = 0.5f * (VLEN[c->type] + VLEN[o->type]) + 0.07f;
-        if (along > 0.02f && along < need && side < 0.09f) { if (gapOut) *gapOut = along; return true; }
+        if (along > 0.02f && side < 0.09f) best = fminf(best, along - need);
     }
-    return false;
+    return best;
 }
 
 static int  ShuttleChoose(Car *c, const int *opts, int no);
 static void ShuttleArrive(Car *c);
 #define STOP_LINE 0.70f
+// turning into a lane: is a vehicle already in that lane close to the entry point (so the turn would overlap it)?
+static bool EntryBlocked(const Car *c, int dir) {
+    float dxv = (float)DX[dir], dyv = (float)DY[dir];
+    float lane = (c->type == V_BIKE) ? 0.33f : 0.17f;
+    float px = c->gx + 0.5f + DY[dir] * lane, py = c->gy + 0.5f - DX[dir] * lane;
+    for (int j = 0; j < MAX_CARS; j++) {
+        const Car *o = &cars[j];
+        if (o == c || !o->active || o->dir != dir || o->arcing) continue;
+        float rx = o->x - px, ry = o->y - py, along = rx * dxv + ry * dyv, side = fabsf(-rx * dyv + ry * dxv);
+        float need = 0.5f * (VLEN[c->type] + VLEN[o->type]) + 0.07f;
+        if (along > -0.05f && along < need && side < 0.12f) return true;
+    }
+    for (int j = 0; j < MAX_UCARS; j++) {
+        const UCar *u = &ucars[j];
+        if (!u->active) continue;
+        float rx = u->x - px, ry = u->z - py, along = rx * dxv + ry * dyv, side = fabsf(-rx * dyv + ry * dxv);
+        float need = 0.5f * (VLEN[c->type] + VLEN[u->type]) + 0.07f;
+        if (along > -0.05f && along < need && side < 0.12f) return true;
+    }
+    return false;
+}
+
+// would a car at (x,y,yaw) newly overlap another vehicle? (it may already be touching one, then it may move on to separate)
+static bool StepHitsVehicle(const Car *c, float x, float y, float yaw) {
+    float L = VLEN[c->type], W = VWID[c->type];
+    for (int j = 0; j < 0; j++) {   // moving traffic is handled by the lane gap
+        const Car *o = &cars[j];
+        if (o == c || !o->active || o->arcing || fabsf(o->x - x) > 0.6f || fabsf(o->y - y) > 0.6f) continue;
+        if (VehOverlap(x, y, yaw, L, W, o->x, o->y, o->yaw, VLEN[o->type], VWID[o->type])
+            && !VehOverlap(c->x, c->y, c->yaw, L, W, o->x, o->y, o->yaw, VLEN[o->type], VWID[o->type])) return true;
+    }
+    for (int j = 0; j < MAX_UCARS; j++) {
+        const UCar *u = &ucars[j];
+        if (!u->active || fabsf(u->x - x) > 0.6f || fabsf(u->z - y) > 0.6f) continue;
+        if (VehOverlap(x, y, yaw, L, W, u->x, u->z, u->yaw, VLEN[u->type], VWID[u->type])
+            && !VehOverlap(c->x, c->y, c->yaw, L, W, u->x, u->z, u->yaw, VLEN[u->type], VWID[u->type])) return true;
+    }
+    return false;
+}
+
+// roundabout: may the car move to (x,y,yaw) without overlapping a vehicle it isn't already touching?
+static bool ArcStepClear(const Car *c, float x, float y, float yaw) {
+    float L = VLEN[c->type], W = VWID[c->type];
+    for (int j = 0; j < MAX_CARS; j++) {
+        const Car *o = &cars[j];
+        if (o == c || !o->active || fabsf(o->x - x) > 0.6f || fabsf(o->y - y) > 0.6f) continue;
+        if (!VehOverlap(x, y, yaw, L, W, o->x, o->y, o->yaw, VLEN[o->type], VWID[o->type])) continue;
+        if (!VehOverlap(c->x, c->y, c->yaw, L, W, o->x, o->y, o->yaw, VLEN[o->type], VWID[o->type])) return false;
+    }
+    for (int j = 0; j < MAX_UCARS; j++) {
+        const UCar *u = &ucars[j];
+        if (!u->active || fabsf(u->x - x) > 0.6f || fabsf(u->z - y) > 0.6f) continue;
+        if (!VehOverlap(x, y, yaw, L, W, u->x, u->z, u->yaw, VLEN[u->type], VWID[u->type])) continue;
+        if (!VehOverlap(c->x, c->y, c->yaw, L, W, u->x, u->z, u->yaw, VLEN[u->type], VWID[u->type])) return false;
+    }
+    return true;
+}
+
 static void UpdateCars(float dt) {
     static float cnt[MAP_H][MAP_W], cntStop[MAP_H][MAP_W];
     memset(cnt, 0, sizeof(cnt)); memset(cntStop, 0, sizeof(cntStop));
@@ -1462,13 +1688,17 @@ static void UpdateCars(float dt) {
         if (c->arcing) {
             // ---- going round a roundabout ------------------------------------
             const float R = 0.30f;
-            c->arcU += dt * v / (c->arcSweep * R);
-            float u = Clamp(c->arcU, 0.0f, 1.0f);
-            float th = c->arcFrom + c->arcSweep * u;
+            float nu = Clamp(c->arcU + dt * v / (c->arcSweep * R), 0.0f, 1.0f);
+            float nth = c->arcFrom + c->arcSweep * nu;
+            float nx = c->gx + 0.5f + R * cosf(nth), ny = c->gy + 0.5f + R * sinf(nth);
+            float nyaw = atan2f(-sinf(nth), cosf(nth)) * RAD2DEG;
+            if (ArcStepClear(c, nx, ny, nyaw)) c->arcU = nu;        // hold on the ring while another car is in the way
+            else { c->wait += dt; c->braking = true; }
+            float th = c->arcFrom + c->arcSweep * Clamp(c->arcU, 0.0f, 1.0f);
             c->x = c->gx + 0.5f + R * cosf(th);
             c->y = c->gy + 0.5f + R * sinf(th);
             c->yaw = atan2f(-sinf(th), cosf(th)) * RAD2DEG;
-            if (c->arcU >= 1.0f) { c->arcing = false; c->t = 0.0f; if (c->claimX >= 0) ReleaseClaim(c); }
+            if (c->arcU >= 1.0f) { c->arcing = false; c->t = 0.0f; c->wait = 0.0f; if (c->claimX >= 0) ReleaseClaim(c); }
         } else {
             // ---- rules of the road: stop lines, give way, pedestrian crossings -----------
             bool must = false; int why = 0;
@@ -1510,15 +1740,21 @@ static void UpdateCars(float dt) {
             else if (must) v = fminf(v, 1.2f);
 
             if (c->shuttle && c->shDwell > 0.0f) { c->shDwell -= dt; v = 0.0f; c->braking = true; }     // passengers boarding
-            float gap = 1.0f;
-            if (LaneBlocked(c, &gap)) {
-                c->wait += dt;
-                if (c->wait < 4.0f) { v = 0.0f; c->braking = true; }   // after 4 s creep on (gridlock breaker)
-            } else c->wait = 0.0f;
+            // car following: never step into the minimum gap, so queued cars can't overlap
+            float free = LaneFreeGap(c);
+            if (free < 0.005f) { v = 0.0f; c->braking = true; c->wait += dt; }
+            else if (free < v * dt) v = free / dt;          // brake early enough to stop exactly at the gap
             if (v == 0.0f) { jammed++; stopWhy[i] = (unsigned char)(c->braking && why ? why : 5); } else stopWhy[i] = 0;
 
             if (c->speeder && v > 2.9f && !c->wanted && c->lostT <= 0.0f && !c->fleeing) { Violation(c, 2); c->lostT = 8.0f; }
 
+            // last check before stepping: never move onto another vehicle, whatever lane or junction it is in
+            if (v > 0.0f && c->t + dt * v < 1.0f && ctrl[c->gy][c->gx] != C_ROUNDABOUT && ctrl[c->ty][c->tx] != C_ROUNDABOUT) {
+                float nt = c->t + dt * v;
+                float ax = c->gx + 0.5f, ay = c->gy + 0.5f, bx = c->tx + 0.5f, by = c->ty + 0.5f;
+                float nx = ax + (bx - ax) * nt + c->ox, ny = ay + (by - ay) * nt + c->oy;
+                if (StepHitsVehicle(c, nx, ny, c->yaw)) { v = 0.0f; c->braking = true; c->wait += dt; }
+            }
             c->t += dt * v;
             if (c->claimX >= 0 && c->gx == c->claimX && c->gy == c->claimY && c->t > 0.55f) ReleaseClaim(c);
 
@@ -1549,6 +1785,7 @@ static void UpdateCars(float dt) {
                     } else if (straight && Rf() < 0.6f) choice = c->dir;
                     else choice = (no > 0) ? opts[GetRandomValue(0, no - 1)] : valid[0];
                 }
+                if (choice >= 0 && ctrl[c->gy][c->gx] != C_ROUNDABOUT && EntryBlocked(c, choice)) { choice = -1; c->wait += dt; c->braking = true; }   // wait at the junction until the lane is clear
                 if (choice >= 0) {
                     if (ctrl[c->gy][c->gx] == C_ROUNDABOUT) {
                         float fromA = atan2f((float)-DY[c->dir], (float)-DX[c->dir]);
@@ -1586,6 +1823,8 @@ static void UpdateCars(float dt) {
         spdSum += c->speedNow;
         int cx = (int)c->x, cy = (int)c->y;
         if (InBounds(cx, cy)) { cnt[cy][cx] += 1.0f; if (c->speedNow < 0.15f) cntStop[cy][cx] += 1.0f; }
+        if (c->speedNow > 0.05f) c->wait = 0.0f;                                        // 'wait' = time held without really moving
+        if (c->wait > 20.0f && !c->wanted && !c->fleeing && !c->shuttle) KillCar(c);     // held 20 s with no way through: remove it rather than let it overlap
     }
     st.vehicles = n;
     st.jammed = jammed;
@@ -2901,7 +3140,10 @@ static bool FpSolid(float px, float pz) {
     float cx = tx + 0.5f, cz = ty + 0.5f, dx = px - cx, dz = pz - cz;
     int s = surface[ty][tx];
     switch (s) {
-        case T_BUILDING: case T_FIRE_STN: case T_POLICE_STN: case T_POWER: case T_WATER: case T_HOSPITAL:
+        case T_BUILDING:
+            if (fabsf(dx) < 0.425f && fabsf(dz) < 0.425f) return true;
+            break;
+        case T_FIRE_STN: case T_POLICE_STN: case T_POWER: case T_WATER: case T_HOSPITAL:
             if (fabsf(dx) < 0.40f && fabsf(dz) < 0.40f) return true;
             break;
         case T_MALL:
@@ -2919,7 +3161,7 @@ static bool FpSolid(float px, float pz) {
         case T_HOUSE: {
             float th = FaceYaw(faceDir[ty][tx]) * DEG2RAD, c = cosf(th), sn = sinf(th);
             float lx = dx * c - dz * sn, lz = dx * sn + dz * c;
-            if (lx > -0.25f && lx < 0.36f && lz > -0.27f && lz < 0.10f) return true;
+            if (lx > HS_CX - HS_W * 0.5f - 0.01f && lx < HS_GX + HS_GW * 0.5f + 0.01f && lz > HS_CZ - HS_L * 0.5f - 0.01f && lz < HS_CZ + HS_L * 0.5f + 0.01f) return true;   // body + garage
             break; }
         default:
             if (zone[ty][tx] == Z_INDUSTRIAL && s == T_GRASS && paved[ty][tx] && !gateTile[ty][tx] && fabsf(dx) < 0.30f && fabsf(dz) < 0.30f) return true;   // container yard
@@ -3185,6 +3427,22 @@ static bool FpStartExit(void) {
 }
 
 // ---- driving --------------------------------------------------------------------------------------
+// exact vehicle-vs-vehicle test for a user car at (x,z,yaw): street traffic and the other user cars
+static bool UCarOverlapsVehicles(float x, float z, float yawDeg, int type, int self) {
+    float L = VLEN[type], W = VWID[type];
+    for (int i = 0; i < MAX_CARS; i++) {
+        const Car *c = &cars[i];
+        if (!c->active || fabsf(c->x - x) > 0.6f || fabsf(c->y - z) > 0.6f) continue;
+        if (VehOverlap(x, z, yawDeg, L, W, c->x, c->y, c->yaw, VLEN[c->type], VWID[c->type])) return true;
+    }
+    for (int i = 0; i < MAX_UCARS; i++) {
+        const UCar *u = &ucars[i];
+        if (!u->active || i == self || fabsf(u->x - x) > 0.6f || fabsf(u->z - z) > 0.6f) continue;
+        if (VehOverlap(x, z, yawDeg, L, W, u->x, u->z, u->yaw, VLEN[u->type], VWID[u->type])) return true;
+    }
+    return false;
+}
+
 static int UCarBlocked(const UCar *u, float x, float z, float yawDeg, int self, int *nSolid) {      // bit 1 = solid scenery, bit 2 = other vehicle / person
     float W = VWID[u->type], L = VLEN[u->type], th = yawDeg * DEG2RAD, c = cosf(th), s = sinf(th);
     static const float P[8][2] = { { 1, 1 }, { -1, 1 }, { 1, -1 }, { -1, -1 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
@@ -3196,7 +3454,8 @@ static int UCarBlocked(const UCar *u, float x, float z, float yawDeg, int self, 
         if (FpSolid(wx, wz)) { solid = true; ns++; }
     }
     if (nSolid) *nSolid = ns;
-    for (int k = -1; k <= 1; k++) if (FpHitDyn(x + s * L * 0.30f * k, z + c * L * 0.30f * k, W * 0.5f, self)) dyn = true;
+    for (int k = -1; k <= 1; k++) if (FpHitDyn(x + s * L * 0.30f * k, z + c * L * 0.30f * k, W * 0.5f, self)) dyn = true;   // people, emergency vehicles, rough car circles
+    if (UCarOverlapsVehicles(x, z, yawDeg, u->type, self)) dyn = true;                                          // exact: no two cars share ground
     return (solid ? 1 : 0) | (dyn ? 2 : 0);
 }
 
@@ -4424,25 +4683,67 @@ static void DrawVehicleLocal(int type, Color col, bool braking, bool lights) {
     BoxC( W * 0.32f, ty, hz, 0.022f, 0.012f, 0.004f, head);
 }
 
+// cyclist: modelled in metres (1 m = 1/17 tile, enlarged 10% so riders stay readable)
+#define M_SC (1.1f / 17.0f)
+static Vector3 MV(float x, float y, float z) { return V3(x * M_SC, y * M_SC, z * M_SC); }
+static void MBox(float x, float y, float z, float w, float h, float l, Color c) { BoxC(x * M_SC, y * M_SC, z * M_SC, w * M_SC, h * M_SC, l * M_SC, c); }
+static void MTube(Vector3 a, Vector3 b, float r, Color c) { GCylinderEx(MV(a.x, a.y, a.z), MV(b.x, b.y, b.z), r * M_SC, r * M_SC, 6, c); }
 static void DrawBike3D(const Car *c) {
     PushFrame(c->x, ENT_Y, c->y, c->yaw);
-    Color frame = A(c->col), tyre = A((Color){ 25, 25, 28, 255 });
-    BoxC(0, 0.025f, 0.050f, 0.012f, 0.040f, 0.040f, tyre);
-    BoxC(0, 0.025f, -0.050f, 0.012f, 0.040f, 0.040f, tyre);
-    BoxC(0, 0.040f, 0.0f, 0.008f, 0.008f, 0.100f, frame);
-    BoxC(0, 0.052f, 0.040f, 0.008f, 0.030f, 0.008f, frame);
-    float sw = sinf((float)GetTime() * 9.0f + c->id) * 0.015f;
-    BoxC(0, 0.056f + sw * 0.2f, -0.030f, 0.018f, 0.006f, 0.030f, A((Color){ 30, 30, 30, 255 }));
-    rlPushMatrix(); rlRotatef(-22.0f, 1, 0, 0);                           // rider leans forward
-    BoxC(0, 0.092f, -0.036f, 0.034f, 0.050f, 0.022f, A(SHIRT_COLS[c->id % 8]));
-    rlPopMatrix();
-    DrawSphere((Vector3){ 0, 0.128f, -0.010f }, 0.017f, A((Color){ 235, 190, 160, 255 }));
-    BoxC(0, 0.140f, -0.010f, 0.030f, 0.012f, 0.030f, A((c->id & 1) ? (Color){ 230, 60, 60, 255 } : (Color){ 60, 160, 230, 255 }));   // helmet
-    BoxC(-0.008f, 0.040f + sw, 0.0f, 0.008f, 0.040f, 0.012f, A((Color){ 50, 60, 100, 255 }));
-    BoxC( 0.008f, 0.040f - sw, 0.0f, 0.008f, 0.040f, 0.012f, A((Color){ 50, 60, 100, 255 }));
+    float t = (float)GetTime();
+    Color frame = A(c->col), tyre = A((Color){ 26, 26, 30, 255 }), rim = A((Color){ 188, 190, 196, 255 });
+    Color skin = A((Color){ 235, 190, 160, 255 }), shirt = A(SHIRT_COLS[c->id % 8]), pants = A((Color){ 46, 52, 72, 255 });
+    Color helmet = A((c->id & 1) ? (Color){ 230, 60, 60, 255 } : (Color){ 60, 160, 230, 255 });
+    Color dark = A((Color){ 32, 32, 36, 255 });
+    // wheels: 0.70 m, axle along X
+    for (int s = 0; s < 2; s++) {
+        float wz = s ? 0.525f : -0.525f;
+        GCylinderEx(MV(-0.02f, 0.35f, wz), MV(0.02f, 0.35f, wz), 0.35f * M_SC, 0.35f * M_SC, 14, tyre);
+        GCylinderEx(MV(-0.024f, 0.35f, wz), MV(0.024f, 0.35f, wz), 0.29f * M_SC, 0.29f * M_SC, 12, rim);
+        GCylinderEx(MV(-0.03f, 0.35f, wz), MV(0.03f, 0.35f, wz), 0.035f * M_SC, 0.035f * M_SC, 6, frame);
+    }
+    // frame
+    Vector3 bb = { 0, 0.30f, -0.05f }, seat = { 0, 0.92f, -0.18f }, head = { 0, 0.90f, 0.40f }, rearAx = { 0, 0.35f, -0.525f };
+    MTube(bb, head, 0.022f, frame);                      // down tube
+    MTube(seat, (Vector3){ 0, 0.96f, 0.38f }, 0.018f, frame);   // top tube
+    MTube(bb, seat, 0.018f, frame);                      // seat tube
+    MTube(bb, rearAx, 0.012f, frame);                    // chain stays
+    MTube(seat, rearAx, 0.010f, frame);                  // seat stays
+    MTube(head, (Vector3){ -0.04f, 0.35f, 0.525f }, 0.012f, frame);   // forks
+    MTube(head, (Vector3){  0.04f, 0.35f, 0.525f }, 0.012f, frame);
+    MTube((Vector3){ 0, 0.96f, 0.40f }, (Vector3){ 0, 1.03f, 0.40f }, 0.020f, dark);   // stem
+    MTube((Vector3){ -0.20f, 1.04f, 0.42f }, (Vector3){ 0.20f, 1.04f, 0.42f }, 0.011f, dark);   // handlebar
+    MBox(0, 0.97f, -0.18f, 0.12f, 0.035f, 0.26f, dark);  // saddle
+    // chainring + pedals
+    GCylinderEx(MV(-0.035f, 0.30f, -0.05f), MV(0.035f, 0.30f, -0.05f), 0.10f * M_SC, 0.10f * M_SC, 10, dark);
+    float crank = t * 7.0f + (float)c->id;
+    for (int s = 0; s < 2; s++) {
+        float a = crank + s * PI;
+        float py = 0.30f + 0.17f * cosf(a), pz = -0.05f + 0.17f * sinf(a);
+        float px = s ? 0.10f : -0.10f;
+        MTube((Vector3){ 0, 0.30f, -0.05f }, (Vector3){ px * 0.6f, py, pz }, 0.008f, dark);   // crank arm
+        MBox(px, py, pz, 0.10f, 0.02f, 0.06f, dark);                                          // pedal
+    }
+    // rider: seated, leaning forward, hands on the bars
+    Vector3 hipC = { 0, 1.00f, -0.18f }, shC = { 0, 1.42f, 0.14f };
+    GCylinderEx(MV(hipC.x, hipC.y, hipC.z), MV(shC.x, shC.y, shC.z), 0.13f * M_SC, 0.12f * M_SC, 8, shirt);   // torso
+    MBox(0, 0.98f, -0.18f, 0.30f, 0.10f, 0.20f, pants);                                                     // hips
+    for (int s = -1; s <= 1; s += 2) {
+        // arm: shoulder to grip
+        MTube((Vector3){ s * 0.17f, 1.38f, 0.14f }, (Vector3){ s * 0.20f, 1.04f, 0.42f }, 0.045f, shirt);
+        // leg: hip -> knee (forward) -> pedal, pedalling in step with the crank
+        float a = crank + ((s > 0) ? PI : 0.0f);
+        Vector3 pedal = { s * 0.10f, 0.30f + 0.17f * cosf(a), -0.05f + 0.17f * sinf(a) };
+        Vector3 hip = { s * 0.09f, 1.00f, -0.18f };
+        Vector3 knee = { s * 0.09f, 0.5f * (hip.y + pedal.y) + 0.02f, 0.5f * (hip.z + pedal.z) + 0.13f };
+        MTube(hip, knee, 0.068f, pants);
+        MTube(knee, pedal, 0.052f, pants);
+        MBox(pedal.x, pedal.y - 0.02f, pedal.z + 0.02f, 0.09f, 0.05f, 0.14f, A((Color){ 30, 30, 34, 255 }));    // shoe
+    }
+    GSphere(MV(0, 1.58f, 0.13f), 0.11f * M_SC, skin);                                   // head
+    GSphere(MV(0, 1.63f, 0.14f), 0.125f * M_SC, helmet);                                 // helmet (top and back)
     PopFrame();
 }
-
 static void DrawCar3D(const Car *c) {
     if (c->type == V_BIKE) { DrawBike3D(c); return; }
     PushFrame(c->x, ENT_Y, c->y, c->yaw);
@@ -4450,13 +4751,13 @@ static void DrawCar3D(const Car *c) {
     if (c->shuttle) {                                                   // autonomous shuttle: teal livery, roof lidar, passenger glow
         BoxC(0, 0.078f, -0.025f, VWID[V_VAN] + 0.004f, 0.028f, 0.252f, A((Color){ 0, 190, 165, 255 }));
         BoxC(0, 0.139f, -0.025f, 0.080f, 0.010f, 0.180f, A((Color){ 235, 245, 245, 255 }));
-        DrawCylinder((Vector3){ 0, 0.144f, 0.040f }, 0.020f, 0.020f, 0.022f, 12, A((Color){ 30, 36, 44, 255 }));
-        DrawSphere((Vector3){ 0, 0.172f, 0.040f }, 0.010f, (Color){ 120, 255, 225, 255 });
-        for (int k = 0; k < c->shPax && k < 8; k++) DrawSphere((Vector3){ ((k % 2) ? 0.026f : -0.026f), 0.108f, -0.11f + (k / 2) * 0.05f }, 0.011f, A(SHIRT_COLS[(c->id + k) % 8]));
+        GCylinder((Vector3){ 0, 0.144f, 0.040f }, 0.020f, 0.020f, 0.022f, 12, A((Color){ 30, 36, 44, 255 }));
+        GSphere((Vector3){ 0, 0.172f, 0.040f }, 0.010f, (Color){ 120, 255, 225, 255 });
+        for (int k = 0; k < c->shPax && k < 8; k++) GSphere((Vector3){ ((k % 2) ? 0.026f : -0.026f), 0.108f, -0.11f + (k / 2) * 0.05f }, 0.011f, A(SHIRT_COLS[(c->id + k) % 8]));
     }
     if (c->wanted) {
         float f = 0.5f + 0.5f * sinf((float)GetTime() * 10.0f);
-        DrawSphere((Vector3){ 0, 0.18f, 0 }, 0.025f + 0.01f * f, c->fleeing ? RED : ORANGE);
+        GSphere((Vector3){ 0, 0.18f, 0 }, 0.025f + 0.01f * f, c->fleeing ? RED : ORANGE);
     }
     PopFrame();
 }
@@ -4471,40 +4772,40 @@ static void DrawTree3D(int x, int y) {
     Color g1 = Shade((Color){ 40, 130, 50, 255 }, 0.85f + ((v >> 5) & 3) * 0.1f);
     Color g2 = Shade(g1, 1.18f), g3 = Shade(g1, 0.72f);
     PushFrame(x + 0.5f, 0, y + 0.5f, (float)(v * 7 % 360));
-    rlScalef(sc, sc, sc);
+    GXScale(sc, sc, sc);
     switch (style) {
     case 0:       // oak
         BoxT(TX_BARK, 0, 0.14f, 0, 0.07f, 0.28f, 0.07f, A(WHITE));
-        DrawSphere((Vector3){ 0, 0.40f, 0 }, 0.20f, A(g1));
-        DrawSphere((Vector3){ 0.11f, 0.33f, 0.07f }, 0.14f, A(g3));
-        DrawSphere((Vector3){ -0.10f, 0.35f, -0.08f }, 0.15f, A(g2));
-        DrawSphere((Vector3){ 0, 0.54f, 0.02f }, 0.13f, A(g2));
+        GSphere((Vector3){ 0, 0.40f, 0 }, 0.20f, A(g1));
+        GSphere((Vector3){ 0.11f, 0.33f, 0.07f }, 0.14f, A(g3));
+        GSphere((Vector3){ -0.10f, 0.35f, -0.08f }, 0.15f, A(g2));
+        GSphere((Vector3){ 0, 0.54f, 0.02f }, 0.13f, A(g2));
         break;
     case 1:       // pine
         BoxT(TX_BARK, 0, 0.06f, 0, 0.05f, 0.12f, 0.05f, A(WHITE));
-        DrawCylinder((Vector3){ 0, 0.08f, 0 }, 0.0f, 0.19f, 0.20f, 9, A(Shade(g3, 0.8f)));
-        DrawCylinder((Vector3){ 0, 0.20f, 0 }, 0.0f, 0.15f, 0.20f, 9, A(Shade(g3, 0.95f)));
-        DrawCylinder((Vector3){ 0, 0.32f, 0 }, 0.0f, 0.11f, 0.20f, 9, A(g3));
-        DrawCylinder((Vector3){ 0, 0.43f, 0 }, 0.0f, 0.065f, 0.17f, 9, A(Shade(g3, 1.1f)));
+        GCylinder((Vector3){ 0, 0.08f, 0 }, 0.0f, 0.19f, 0.20f, 9, A(Shade(g3, 0.8f)));
+        GCylinder((Vector3){ 0, 0.20f, 0 }, 0.0f, 0.15f, 0.20f, 9, A(Shade(g3, 0.95f)));
+        GCylinder((Vector3){ 0, 0.32f, 0 }, 0.0f, 0.11f, 0.20f, 9, A(g3));
+        GCylinder((Vector3){ 0, 0.43f, 0 }, 0.0f, 0.065f, 0.17f, 9, A(Shade(g3, 1.1f)));
         break;
     case 2:       // tall poplar
         BoxT(TX_BARK, 0, 0.07f, 0, 0.05f, 0.14f, 0.05f, A(WHITE));
-        rlPushMatrix(); rlTranslatef(0, 0.40f, 0); rlScalef(0.55f, 1.9f, 0.55f);
-        DrawSphere((Vector3){ 0, 0, 0 }, 0.14f, A(g2));
-        rlPopMatrix();
+        GXPush(); GXTrans(0, 0.40f, 0); GXScale(0.55f, 1.9f, 0.55f);
+        GSphere((Vector3){ 0, 0, 0 }, 0.14f, A(g2));
+        GXPop();
         break;
     case 3:       // birch
         BoxC(0, 0.15f, 0, 0.045f, 0.30f, 0.045f, A((Color){ 228, 226, 214, 255 }));
         BoxC(0, 0.12f, 0.0235f, 0.02f, 0.01f, 0.004f, A((Color){ 40, 40, 40, 255 }));
-        DrawSphere((Vector3){ 0, 0.38f, 0 }, 0.15f, A(Shade(g2, 1.1f)));
-        DrawSphere((Vector3){ 0.09f, 0.31f, 0.04f }, 0.10f, A(g2));
-        DrawSphere((Vector3){ -0.08f, 0.45f, -0.03f }, 0.10f, A(Shade(g1, 1.15f)));
+        GSphere((Vector3){ 0, 0.38f, 0 }, 0.15f, A(Shade(g2, 1.1f)));
+        GSphere((Vector3){ 0.09f, 0.31f, 0.04f }, 0.10f, A(g2));
+        GSphere((Vector3){ -0.08f, 0.45f, -0.03f }, 0.10f, A(Shade(g1, 1.15f)));
         break;
     default:      // blossom tree
         BoxT(TX_BARK, 0, 0.12f, 0, 0.06f, 0.24f, 0.06f, A(WHITE));
-        DrawSphere((Vector3){ 0, 0.34f, 0 }, 0.18f, A((Color){ 245, 175, 195, 255 }));
-        DrawSphere((Vector3){ 0.10f, 0.30f, 0.05f }, 0.12f, A((Color){ 250, 200, 215, 255 }));
-        DrawSphere((Vector3){ -0.09f, 0.40f, -0.04f }, 0.11f, A((Color){ 235, 150, 180, 255 }));
+        GSphere((Vector3){ 0, 0.34f, 0 }, 0.18f, A((Color){ 245, 175, 195, 255 }));
+        GSphere((Vector3){ 0.10f, 0.30f, 0.05f }, 0.12f, A((Color){ 250, 200, 215, 255 }));
+        GSphere((Vector3){ -0.09f, 0.40f, -0.04f }, 0.11f, A((Color){ 235, 150, 180, 255 }));
         break;
     }
     PopFrame();
@@ -4518,7 +4819,7 @@ static void DrawDeco3D(int x, int y) {
     if (d == 1) {          // shrubbery
         for (int k = 0; k < 4; k++) {
             float ox = ((v >> k) & 3) * 0.2f - 0.3f, oz = ((v >> (k + 2)) & 3) * 0.2f - 0.3f;
-            DrawSphere((Vector3){ cx + ox, 0.05f, cz + oz }, 0.06f + 0.01f * k, (k & 1) ? sh1 : sh2);
+            GSphere((Vector3){ cx + ox, 0.05f, cz + oz }, 0.06f + 0.01f * k, (k & 1) ? sh1 : sh2);
         }
     } else if (d == 2) {   // hedge row
         bool alongX = (v & 1);
@@ -4529,7 +4830,7 @@ static void DrawDeco3D(int x, int y) {
         for (int k = 0; k < 9; k++) {
             float ox = (k % 3 - 1) * 0.17f, oz = (k / 3 - 1) * 0.12f;
             Color fc = (k + v) % 3 == 0 ? (Color){ 235, 70, 90, 255 } : ((k + v) % 3 == 1 ? (Color){ 250, 215, 70, 255 } : (Color){ 190, 110, 230, 255 });
-            DrawSphere((Vector3){ cx + ox, 0.05f, cz + oz }, 0.022f, A(fc));
+            GSphere((Vector3){ cx + ox, 0.05f, cz + oz }, 0.022f, A(fc));
             BoxC(cx + ox, 0.03f, cz + oz, 0.004f, 0.03f, 0.004f, sh1);
         }
     }
@@ -4540,12 +4841,16 @@ static void DrawGrassTufts(int x, int y) {
     for (int k = 0; k < 5; k++) {
         float ox = Hash01(x, y, k) * 0.84f + 0.08f, oz = Hash01(y, x, k + 9) * 0.84f + 0.08f;
         Color g = Shade((Color){ 64, 150, 58, 255 }, 0.8f + Hash01(k, x + y, 3) * 0.5f);
-        DrawCylinder((Vector3){ x + ox, 0.03f, y + oz }, 0.0f, 0.016f, 0.05f + 0.03f * ((v >> k) & 1), 4, A(g));
+        GCylinder((Vector3){ x + ox, 0.03f, y + oz }, 0.0f, 0.016f, 0.05f + 0.03f * ((v >> k) & 1), 4, A(g));
     }
 }
 
 // ---------------------------------------------------------------------------
 // 3D drawing - houses in the gated communities
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 3D drawing - houses in the gated communities
+// house footprint (local frame, front = +Z): one set of numbers drives walls, roof, garage and collisions
 // ---------------------------------------------------------------------------
 static void DrawHouse3D(int x, int y) {
     static const Color tints[5] = { {255,255,255,255}, {255,236,214,255}, {214,236,255,255}, {236,255,222,255}, {255,224,224,255} };
@@ -4560,54 +4865,62 @@ static void DrawHouse3D(int x, int y) {
     bool lit = NightNow() && !dmg && (v & 4);
     PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(f));
 
-    // main block, roof, garage
-    BoxT(wallTex, -0.05f, 0.10f, -0.08f, 0.34f, 0.20f, 0.32f, wall);
-    if (rtype == 0)      RoofGable(0.40f, 0.38f, 0.20f, 0.12f, false, roof, wallTex, wall);
-    else if (rtype == 1) RoofGable(0.40f, 0.38f, 0.20f, 0.13f, true, roof, wallTex, wall);
-    else if (rtype == 2) RoofHip(0.40f, 0.38f, 0.20f, 0.12f, roof);
-    else { BoxC(-0.05f, 0.215f, -0.08f, 0.38f, 0.03f, 0.36f, Shade(roof, 0.8f)); }
-    if (rtype != 3) { rlPushMatrix(); rlTranslatef(-0.05f, 0, -0.08f); rlPopMatrix(); }
-    if (GreenRoof(x, y)) GreenRoof3D(0.238f, -0.05f, -0.08f, 0.36f, 0.34f);
+    // main block and roof (the roof is built on the same footprint as the walls, so it sits flush)
+    BoxT(wallTex, HS_CX, HS_WH * 0.5f, HS_CZ, HS_W, HS_WH, HS_L, wall);
+    GXPush(); GXTrans(HS_CX, 0.0f, HS_CZ);
+    if (rtype == 0)      RoofGable(HS_W, HS_L, HS_WH, HS_RH, false, roof, wallTex, wall);
+    else if (rtype == 1) RoofGable(HS_W, HS_L, HS_WH, HS_RH, true, roof, wallTex, wall);
+    else if (rtype == 2) RoofHip(HS_W, HS_L, HS_WH, HS_RH, roof);
+    else                 BoxC(0, HS_WH + 0.012f, 0, HS_W, 0.024f, HS_L, ShadeF(roof, 0.8f));
     if (smartCity && !dmg) HouseSolar3D(rtype);
-    if (v & 1) BoxT(TX_BRICK, -0.16f, 0.30f, -0.15f, 0.05f, 0.12f, 0.05f, A(WHITE));       // chimney
-    BoxT(TX_STUCCO, 0.26f, 0.07f, -0.04f, 0.16f, 0.14f, 0.26f, wall);                       // garage
-    BoxC(0.26f, 0.148f, -0.04f, 0.18f, 0.02f, 0.28f, Shade(roof, 0.85f));
-    BoxC(0.26f, 0.05f, 0.0925f, 0.12f, 0.09f, 0.006f, A((Color){ 225, 225, 228, 255 }));    // garage door
-    for (int k = 0; k < 3; k++) BoxC(0.26f, 0.025f + k * 0.03f, 0.096f, 0.12f, 0.003f, 0.002f, A((Color){ 170, 170, 175, 255 }));
+    if (GreenRoof(x, y) && rtype == 3) GreenRoof3D(HS_WH + 0.026f, 0, 0, HS_W, HS_L);
+    GXPop();
+    if (v & 1) BoxT(TX_BRICK, HS_CX - 0.10f, HS_WH + 0.07f, HS_CZ - 0.09f, 0.05f, 0.14f, 0.05f, A(WHITE));   // chimney
+
+    // garage: flat roof flush with its walls
+    BoxT(TX_STUCCO, HS_GX, HS_GH * 0.5f, HS_GZ, HS_GW, HS_GH, HS_GL, wall);
+    BoxC(HS_GX, HS_GH + 0.012f, HS_GZ, HS_GW, 0.024f, HS_GL, A(ShadeF(roofs[(v >> 4) % 5], 0.85f)));
+    float gzf = HS_GZ + HS_GL * 0.5f + 0.0025f;
+    BoxC(HS_GX, 0.055f, gzf, HS_GW - 0.03f, 0.09f, 0.006f, A((Color){ 225, 225, 228, 255 }));    // garage door
+    for (int k = 0; k < 3; k++) BoxC(HS_GX, 0.025f + k * 0.03f, gzf + 0.001f, HS_GW - 0.03f, 0.003f, 0.002f, A((Color){ 170, 170, 175, 255 }));
 
     // front door + windows (lit at night)
-    float zf = 0.0825f;
-    BoxC(-0.12f, 0.05f, zf, 0.05f, 0.09f, 0.006f, A((Color){ 90 + (v & 63), 60, 45, 255 }));
+    float zf = HS_CZ + HS_L * 0.5f + 0.0025f;
+    BoxC(HS_CX - 0.08f, 0.06f, zf, 0.05f, 0.11f, 0.006f, A((Color){ 90 + (v & 63), 60, 45, 255 }));
     Color win = lit ? (Color){ 255, 226, 130, 255 } : (Color){ 70, 100, 130, 255 };
-    BoxC(-0.02f, 0.12f, zf, 0.075f, 0.065f, 0.006f, A(win));
-    BoxC(-0.12f, 0.13f, zf, 0.050f, 0.050f, 0.006f, A(win));
-    BoxC(-0.02f, 0.12f, zf + 0.002f, 0.004f, 0.065f, 0.002f, A(WHITE));
-    BoxC(-0.20f, 0.12f, -0.08f, 0.006f, 0.060f, 0.07f, A(win));
+    BoxC(HS_CX + 0.07f, 0.13f, zf, 0.09f, 0.07f, 0.006f, A(win));
+    BoxC(HS_CX + 0.07f, 0.13f, zf + 0.002f, 0.004f, 0.07f, 0.002f, A(WHITE));
+    BoxC(HS_CX - 0.19f, 0.13f, zf, 0.06f, 0.06f, 0.006f, A(win));
+    BoxC(HS_CX - HS_W * 0.5f - 0.0025f, 0.13f, HS_CZ - 0.04f, 0.006f, 0.06f, 0.08f, A(win));    // side window
 
-    // driveway, parked car, garden
-    BoxC(0.26f, 0.006f, 0.30f, 0.15f, 0.012f, 0.42f, A((Color){ 165, 165, 168, 255 }));
-    BoxC(-0.20f, 0.004f, 0.30f, 0.07f, 0.008f, 0.38f, A((Color){ 205, 195, 175, 255 }));      // garden path
-    if (drive[y][x]) {
-        PushFrame(0.26f, 0.008f, 0.30f, 0.0f);
-        DrawVehicleLocal(drive[y][x] - 1, CAR_COLS[drvCol[y][x]], false, NightNow());
-        PopFrame();
-    }
-    DrawSphere((Vector3){ -0.33f, 0.04f, 0.28f }, 0.05f, A((Color){ 48, 125, 55, 255 }));
-    DrawSphere((Vector3){ -0.27f, 0.035f, 0.40f }, 0.04f, A((Color){ 62, 145, 62, 255 }));
+    // driveway, garden path, garden (the parked car is drawn live, see DrawHouseDrive3D)
+    BoxC(HS_GX, 0.006f, 0.30f, 0.15f, 0.012f, 0.42f, A((Color){ 165, 165, 168, 255 }));
+    BoxC(-0.22f, 0.004f, 0.30f, 0.07f, 0.008f, 0.38f, A((Color){ 205, 195, 175, 255 }));      // garden path
+    GSphere(V3(-0.36f, 0.04f, 0.26f), 0.05f, A((Color){ 48, 125, 55, 255 }));
+    GSphere(V3(-0.30f, 0.035f, 0.40f), 0.04f, A((Color){ 62, 145, 62, 255 }));
     for (int k = 0; k < 4; k++)
-        DrawSphere((Vector3){ -0.40f + k * 0.045f, 0.022f, 0.12f }, 0.014f, A(k & 1 ? (Color){ 240, 90, 120, 255 } : (Color){ 250, 215, 70, 255 }));
+        GSphere(V3(-0.42f + k * 0.045f, 0.022f, 0.12f), 0.014f, A(k & 1 ? (Color){ 240, 90, 120, 255 } : (Color){ 250, 215, 70, 255 }));
     if (v & 2) {          // back garden tree
         BoxT(TX_BARK, -0.30f, 0.07f, -0.36f, 0.04f, 0.14f, 0.04f, A(WHITE));
-        DrawSphere((Vector3){ -0.30f, 0.20f, -0.36f }, 0.11f, A((Color){ 55, 140, 55, 255 }));
+        GSphere(V3(-0.30f, 0.20f, -0.36f), 0.11f, A((Color){ 55, 140, 55, 255 }));
     } else if (v & 32) {  // swimming pool
         BoxC(-0.12f, 0.004f, -0.36f, 0.26f, 0.008f, 0.17f, A((Color){ 225, 225, 225, 255 }));
         BoxC(-0.12f, 0.009f, -0.36f, 0.22f, 0.006f, 0.13f, A((Color){ 70, 165, 220, 255 }));
     }
-    if (v & 16) BoxT(TX_CORRUG, 0.35f, 0.04f, -0.40f, 0.10f, 0.08f, 0.09f, A(WHITE));       // shed
+    if (v & 16) BoxT(TX_CORRUG, 0.36f, 0.04f, -0.40f, 0.10f, 0.08f, 0.09f, A(WHITE));       // shed
     BoxT(TX_HEDGE, 0, 0.035f, -0.47f, 0.90f, 0.07f, 0.05f, A(WHITE));                       // back hedge
     PopFrame();
 }
 
+// the car parked on the driveway (live: it changes when cars come and go)
+static void DrawHouseDrive3D(int x, int y) {
+    if (!drive[y][x] || surface[y][x] != T_HOUSE) return;
+    PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(faceDir[y][x]));
+    PushFrame(HS_GX, 0.008f, 0.30f, 0.0f);
+    DrawVehicleLocal(drive[y][x] - 1, CAR_COLS[drvCol[y][x]], false, NightNow());
+    PopFrame();
+    PopFrame();
+}
 // ---------------------------------------------------------------------------
 // 3D drawing - other buildings
 // ---------------------------------------------------------------------------
@@ -4622,50 +4935,59 @@ static void DrawBuilding3D(int x, int y) {
     int fl = (int)(h * 10.0f + 0.5f);
     if (fl < 1) fl = 1;
     bool dmg = health[y][x] < 50.0f, night = NightNow();
+    float H = fl * FLOOR_H;                                       // building height (tile units)
     Color tint = A(dmg ? (Color){ 110, 90, 85, 255 } : (Color){ (unsigned char)(235 + (v & 15)), (unsigned char)(235 + ((v >> 2) & 15)), 255, 255 });
     int side = RoadSide(x, y);
     int wt = (bType[y][x] == B_COM) ? (fl >= 8 ? (night ? TX_WIN_GLASS_N : TX_WIN_GLASS) : (night ? TX_WIN_OFFICE_N : TX_WIN_OFFICE))
                                     : (night ? TX_WIN_BRICK_N : TX_WIN_BRICK);
     PushFrame(cx, 0, cz, FaceYaw(side));
-    if (fl >= 10) {                                   // skyrise: podium, tower, crown
+    if (fl >= 10) {                                   // skyrise: podium, tower, crown (the beacon is live)
         int f1 = fl * 35 / 100; if (f1 < 2) f1 = 2;
         int f2 = fl - f1;
-        float h1 = f1 * 0.1f, h2 = f2 * 0.1f;
-        WindowBox(wt, f1, 0, h1 / 2, 0, 0.72f, h1, 0.72f, tint);
-        WindowBox(wt, f2, 0, h1 + h2 / 2, 0, 0.56f, h2, 0.56f, tint);
-        BoxC(0, h1 + 0.005f, 0, 0.74f, 0.012f, 0.74f, A((Color){ 120, 122, 128, 255 }));        // podium ledge
-        BoxC(0, h + 0.02f, 0, 0.60f, 0.04f, 0.60f, A((Color){ 105, 108, 115, 255 }));           // crown
-        BoxC(0.12f, h + 0.07f, 0.1f, 0.14f, 0.06f, 0.12f, A((Color){ 150, 152, 158, 255 }));    // plant room
-        BoxC(-0.1f, h + 0.18f, -0.1f, 0.012f, 0.28f, 0.012f, A((Color){ 200, 200, 205, 255 }));  // mast
-        if (night || (int)(GetTime() * 1.2f) % 2) DrawSphere((Vector3){ -0.1f, h + 0.33f, -0.1f }, 0.016f, A(RED));
-        BoxC(0, 0.04f, 0.37f, 0.30f, 0.08f, 0.02f, A((Color){ 40, 50, 60, 255 }));              // lobby doors
+        float h1 = f1 * FLOOR_H, h2 = f2 * FLOOR_H;
+        WindowBox(wt, f1, 0, h1 / 2, 0, 0.84f, h1, 0.84f, tint);
+        WindowBox(wt, f2, 0, h1 + h2 / 2, 0, 0.66f, h2, 0.66f, tint);
+        BoxC(0, h1 + 0.005f, 0, 0.86f, 0.012f, 0.86f, A((Color){ 120, 122, 128, 255 }));        // podium ledge
+        BoxC(0, H + 0.02f, 0, 0.70f, 0.04f, 0.70f, A((Color){ 105, 108, 115, 255 }));           // crown
+        BoxC(0.14f, H + 0.07f, 0.12f, 0.16f, 0.06f, 0.14f, A((Color){ 150, 152, 158, 255 }));   // plant room
+        BoxC(-0.12f, H + 0.18f, -0.12f, 0.012f, 0.28f, 0.012f, A((Color){ 200, 200, 205, 255 })); // mast
+        BoxC(0, 0.04f, 0.43f, 0.32f, 0.08f, 0.02f, A((Color){ 40, 50, 60, 255 }));              // lobby doors
         if (smartCity && !dmg) {                                                                  // smart city: green facades + roof solar
-            LivingWall(0.0f, f1, 0.72f, 3);
-            LivingWall(h1, f2, 0.56f, 1);
-            RooftopGarden3D(h);
-            SolarPanel(-0.20f, h + 0.065f, 0.18f, 0.15f, 0.11f, 12.0f);
-            SolarPanel( 0.20f, h + 0.065f, 0.20f, 0.15f, 0.11f, 12.0f);
-            SolarPanel( 0.00f, h + 0.065f, -0.05f, 0.15f, 0.11f, 12.0f);
+            LivingWall(0.0f, f1, 0.84f, 3);
+            LivingWall(h1, f2, 0.66f, 1);
+            RooftopGarden3D(H);
+            SolarPanel(-0.20f, H + 0.065f, 0.18f, 0.15f, 0.11f, 12.0f);
+            SolarPanel( 0.20f, H + 0.065f, 0.20f, 0.15f, 0.11f, 12.0f);
+            SolarPanel( 0.00f, H + 0.065f, -0.05f, 0.15f, 0.11f, 12.0f);
         }
     } else {
-        WindowBox(wt, fl, 0, h / 2, 0, 0.74f, h, 0.74f, tint);
-        if (bType[y][x] == B_RES && fl <= 4 && (v & 1)) RoofGable(0.78f, 0.78f, h, 0.14f, (v & 2) != 0, A((Color){ 150, 100, 90, 255 }), TX_BRICK, A(WHITE));
-        else BoxC(0, h + 0.01f, 0, 0.78f, 0.03f, 0.78f, A((Color){ 112, 114, 120, 255 }));
-        BoxC(-0.15f, h + 0.05f, 0.1f, 0.12f, 0.05f, 0.14f, A((Color){ 150, 152, 158, 255 }));
-        if (GreenRoof(x, y)) GreenRoof3D(h + 0.032f, 0.0f, 0.0f, 0.74f, 0.74f);
+        WindowBox(wt, fl, 0, H / 2, 0, 0.85f, H, 0.85f, tint);
+        if (bType[y][x] == B_RES && fl <= 4 && (v & 1)) RoofGable(0.90f, 0.90f, H, 0.14f, (v & 2) != 0, A((Color){ 150, 100, 90, 255 }), TX_BRICK, A(WHITE));
+        else BoxC(0, H + 0.01f, 0, 0.90f, 0.03f, 0.90f, A((Color){ 112, 114, 120, 255 }));
+        BoxC(-0.16f, H + 0.05f, 0.12f, 0.13f, 0.05f, 0.14f, A((Color){ 150, 152, 158, 255 }));
+        if (GreenRoof(x, y)) GreenRoof3D(H + 0.032f, 0.0f, 0.0f, 0.85f, 0.85f);
         if (smartCity && !dmg) {
-            if (bType[y][x] == B_RES && fl <= 4 && (v & 1)) GableSolar((v & 2) != 0, 0.39f, h, 0.14f, 0.08f, 0.34f, 0.30f);
-            else FlatSolar(0.0f, -0.14f, h + 0.045f, 3, 2, 0.24f, 0.20f, 0.20f, 0.14f, 12.0f);
+            if (bType[y][x] == B_RES && fl <= 4 && (v & 1)) GableSolar((v & 2) != 0, 0.45f, H, 0.14f, 0.08f, 0.38f, 0.32f);
+            else FlatSolar(0.0f, -0.14f, H + 0.045f, 3, 2, 0.24f, 0.20f, 0.20f, 0.14f, 12.0f);
         }
         if (bType[y][x] == B_COM && fl < 8) {          // shop awning
             Color aw = (v & 1) ? (Color){ 200, 60, 60, 255 } : (Color){ 60, 120, 190, 255 };
-            BoxC(0, 0.11f, 0.42f, 0.66f, 0.02f, 0.10f, A(aw));
+            BoxC(0, 0.11f, 0.45f, 0.70f, 0.02f, 0.10f, A(aw));
         }
-        BoxC(0, 0.04f, 0.375f, 0.20f, 0.08f, 0.012f, A((Color){ 45, 50, 60, 255 }));
+        BoxC(0, 0.04f, 0.43f, 0.20f, 0.08f, 0.012f, A((Color){ 45, 50, 60, 255 }));
     }
     PopFrame();
 }
 
+// skyrise beacon (blinks at night)
+static void DrawBuildingLive3D(int x, int y) {
+    int fl = (int)(bHeight[y][x] * 10.0f + 0.5f);
+    if (fl < 10) return;
+    float H = fl * FLOOR_H;
+    PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(RoadSide(x, y)));
+    if (NightNow() || (int)(GetTime() * 1.2f) % 2) GSphere(V3(-0.12f, H + 0.33f, -0.12f), 0.016f, RED);
+    PopFrame();
+}
 static void DrawIndustrial3D(int x, int y) {
     unsigned char v = vr[y][x];
     float h = bHeight[y][x], cx = x + 0.5f, cz = y + 0.5f;
@@ -4674,11 +4996,11 @@ static void DrawIndustrial3D(int x, int y) {
     PushFrame(cx, 0, cz, FaceYaw(RoadSide(x, y)));
     if (deco[y][x] == 0) {              // factory with chimney and vents
         BoxT(TX_CORRUG, 0, h / 2, 0, 0.84f, h, 0.72f, tint);
-        for (int k = 0; k < 3; k++) RoofGable(0.26f, 0.72f, h, 0.07f, true, A((Color){ 140, 145, 150, 255 }), TX_CORRUG, tint);
+        for (int k = 0; k < 3; k++) { GXPush(); GXTrans(-0.28f + k * 0.28f, 0, 0); RoofGable(0.28f, 0.72f, h, 0.07f, true, A((Color){ 140, 145, 150, 255 }), TX_CORRUG, tint); GXPop(); }
         BoxC(-0.28f, h + 0.04f, 0.0f, 0.12f, 0.08f, 0.12f, A((Color){ 100, 104, 110, 255 }));
-        DrawCylinder((Vector3){ 0.24f, h, -0.20f }, 0.065f, 0.08f, 0.22f, 12, A((Color){ 150, 70, 55, 255 }));
-        DrawCylinder((Vector3){ 0.24f, h + 0.22f, -0.20f }, 0.055f, 0.065f, 0.16f, 12, A((Color){ 235, 235, 235, 255 }));
-        DrawCylinder((Vector3){ 0.24f, h + 0.38f, -0.20f }, 0.050f, 0.055f, 0.06f, 12, A((Color){ 200, 50, 45, 255 }));
+        GCylinder((Vector3){ 0.24f, h, -0.20f }, 0.065f, 0.08f, 0.22f, 12, A((Color){ 150, 70, 55, 255 }));
+        GCylinder((Vector3){ 0.24f, h + 0.22f, -0.20f }, 0.055f, 0.065f, 0.16f, 12, A((Color){ 235, 235, 235, 255 }));
+        GCylinder((Vector3){ 0.24f, h + 0.38f, -0.20f }, 0.050f, 0.055f, 0.06f, 12, A((Color){ 200, 50, 45, 255 }));
         BoxC(0.0f, 0.06f, 0.365f, 0.30f, 0.12f, 0.012f, A((Color){ 70, 78, 88, 255 }));
         BoxC(0.0f, 0.12f, 0.372f, 0.34f, 0.01f, 0.012f, A((Color){ 240, 190, 40, 255 }));
         if (smartCity && !dmg) {
@@ -4696,13 +5018,13 @@ static void DrawIndustrial3D(int x, int y) {
         }
         if (smartCity && !dmg) GableSolar(false, 0.47f, h, 0.07f, 0.08f, 0.40f, 0.30f);
     } else {                            // tank farm
-        DrawCylinder((Vector3){ -0.22f, 0, -0.05f }, 0.19f, 0.19f, 0.56f, 20, A((Color){ 205, 208, 212, 255 }));
-        DrawCylinder((Vector3){ -0.22f, 0.56f, -0.05f }, 0.0f, 0.19f, 0.05f, 20, A((Color){ 170, 174, 180, 255 }));
-        DrawCylinder((Vector3){ 0.23f, 0, 0.12f }, 0.15f, 0.15f, 0.44f, 18, A((Color){ 225, 226, 230, 255 }));
-        DrawCylinder((Vector3){ 0.23f, 0.44f, 0.12f }, 0.0f, 0.15f, 0.04f, 18, A((Color){ 185, 188, 194, 255 }));
+        GCylinder((Vector3){ -0.22f, 0, -0.05f }, 0.19f, 0.19f, 0.56f, 20, A((Color){ 205, 208, 212, 255 }));
+        GCylinder((Vector3){ -0.22f, 0.56f, -0.05f }, 0.0f, 0.19f, 0.05f, 20, A((Color){ 170, 174, 180, 255 }));
+        GCylinder((Vector3){ 0.23f, 0, 0.12f }, 0.15f, 0.15f, 0.44f, 18, A((Color){ 225, 226, 230, 255 }));
+        GCylinder((Vector3){ 0.23f, 0.44f, 0.12f }, 0.0f, 0.15f, 0.04f, 18, A((Color){ 185, 188, 194, 255 }));
         BoxC(0.0f, 0.10f, 0.1f, 0.5f, 0.02f, 0.02f, A((Color){ 160, 80, 60, 255 }));
         BoxC(-0.22f, 0.30f, 0.14f, 0.02f, 0.5f, 0.02f, A((Color){ 120, 124, 130, 255 }));
-        if (v & 1) DrawCylinder((Vector3){ 0.02f, 0, -0.36f }, 0.07f, 0.07f, 0.22f, 12, A((Color){ 230, 200, 60, 255 }));
+        if (v & 1) GCylinder((Vector3){ 0.02f, 0, -0.36f }, 0.07f, 0.07f, 0.22f, 12, A((Color){ 230, 200, 60, 255 }));
     }
     PopFrame();
 }
@@ -4746,6 +5068,15 @@ static void DrawParkingLot3D(int x, int y) {
     for (int c = 0; c <= 4; c++)
         for (int r = 0; r < 2; r++)
             BoxC(x + c * 0.25f, 0.066f, y + 0.30f + r * 0.40f, 0.012f, 0.004f, 0.34f, A((Color){ 240, 240, 240, 255 }));
+    if (((x + y) & 1) == 0) {               // lamp posts (the glow is live)
+        BoxC(cx, 0.18f, cz, 0.014f, 0.36f, 0.014f, A((Color){ 70, 72, 78, 255 }));
+        BoxC(cx, 0.37f, cz, 0.07f, 0.014f, 0.03f, A((Color){ 70, 72, 78, 255 }));
+    }
+}
+
+// cars in the bays and the lamp glow (live)
+static void DrawParkingLive3D(int x, int y) {
+    float cx = x + 0.5f, cz = y + 0.5f;
     for (int s = 0; s < 8; s++) {
         if (!lot[y][x][s]) continue;
         int col = s % 4, row = s / 4;
@@ -4753,16 +5084,10 @@ static void DrawParkingLot3D(int x, int y) {
         DrawVehicleLocal(lot[y][x][s] - 1, CAR_COLS[lotCol[y][x][s]], false, NightNow());
         PopFrame();
     }
-    if (((x + y) & 1) == 0) {               // lamp posts
-        BoxC(cx, 0.18f, cz, 0.014f, 0.36f, 0.014f, A((Color){ 70, 72, 78, 255 }));
-        BoxC(cx, 0.37f, cz, 0.07f, 0.014f, 0.03f, A((Color){ 70, 72, 78, 255 }));
-        if (NightNow()) DrawSphere((Vector3){ cx, 0.355f, cz }, 0.022f, (Color){ 255, 240, 170, 255 });
-    }
+    if (((x + y) & 1) == 0 && NightNow()) GSphere(V3(cx, 0.355f, cz), 0.022f, (Color){ 255, 240, 170, 255 });
 }
-
+// the static part of the tip: weighbridge and loose refuse (the mounds are live)
 static void DrawLandfill3D(int x, int y) {
-    unsigned char v = vr[y][x];
-    float fillK = 0.55f + 0.9f * landfillFill / 100.0f;
     float cx = x + 0.5f, cz = y + 0.5f;
     if (gateTile[y][x]) {                   // weighbridge + site office
         BoxC(cx, 0.10f, cz - 0.28f, 0.34f, 0.20f, 0.22f, A((Color){ 205, 205, 195, 255 }));
@@ -4770,20 +5095,31 @@ static void DrawLandfill3D(int x, int y) {
         BoxC(cx, 0.012f, cz + 0.15f, 0.55f, 0.024f, 0.20f, A((Color){ 100, 100, 108, 255 }));
         return;
     }
-    for (int k = 0; k < 3; k++) {
-        float ox = (((v >> (k * 2)) & 3) - 1.5f) * 0.26f, oz = (((v >> (k + 3)) & 3) - 1.5f) * 0.26f;
-        float r = (0.20f + 0.05f * ((v >> k) & 3)), hh = bHeight[y][x] * fillK * (0.8f + 0.25f * k);
-        rlPushMatrix(); rlTranslatef(cx + ox, 0.0f, cz + oz); rlScalef(1.0f, hh / r * 0.8f, 1.0f);
-        DrawSphere((Vector3){ 0, 0, 0 }, r, A(Shade((Color){ 98, 84, 66, 255 }, 0.8f + 0.1f * k)));
-        rlPopMatrix();
-    }
-    for (int k = 0; k < 14; k++) {          // loose refuse
-        float ox = Hash01(x, y, k) - 0.5f, oz = Hash01(y, x, k + 5) - 0.5f;
+    for (int k = 0; k < 14; k++) {          // loose refuse, kept inside the fence
+        float ox = (Hash01(x, y, k) - 0.5f) * 0.6f, oz = (Hash01(y, x, k + 5) - 0.5f) * 0.6f;
         Color c = (Color){ (unsigned char)(80 + Hash01(k, x, 3) * 170), (unsigned char)(80 + Hash01(k, y, 4) * 170), (unsigned char)(80 + Hash01(x, k, 5) * 170), 255 };
-        BoxC(cx + ox * 0.9f, 0.06f + 0.14f * Hash01(k, y, x), cz + oz * 0.9f, 0.025f, 0.015f, 0.025f, A(c));
+        BoxC(cx + ox, 0.06f + 0.14f * Hash01(k, y, x), cz + oz, 0.025f, 0.015f, 0.025f, A(c));
     }
 }
 
+// the mounds of waste (live, they grow with the fill level). Every mound is kept inside the fence.
+static void DrawLandfillMounds3D(int x, int y) {
+    unsigned char v = vr[y][x];
+    if (gateTile[y][x] || surface[y][x] != T_LANDFILL) return;
+    if (IsRecycleTile(x, y)) return;
+    float fillK = 0.55f + 0.9f * landfillFill / 100.0f;
+    float cx = x + 0.5f, cz = y + 0.5f;
+    for (int k = 0; k < 3; k++) {
+        float r = 0.12f + 0.04f * ((v >> k) & 3);                  // 0.12 .. 0.24 tile
+        float lim = 0.30f - r;                                    // fence stands at 0.33 from the tile centre
+        float ox = (((v >> (k * 2)) & 3) - 1.5f) * 0.20f, oz = (((v >> (k + 3)) & 3) - 1.5f) * 0.20f;
+        ox = Clamp(ox, -lim, lim); oz = Clamp(oz, -lim, lim);
+        float hh = bHeight[y][x] * fillK * (0.8f + 0.25f * k);
+        GXPush(); GXTrans(cx + ox, 0.0f, cz + oz); GXScale(1.0f, hh / r * 0.8f, 1.0f);
+        GSphere(V3(0, 0, 0), r, A(Shade((Color){ 98, 84, 66, 255 }, 0.8f + 0.1f * k)));
+        GXPop();
+    }
+}
 static void DrawRuin3D(int x, int y) {
     unsigned char v = vr[y][x];
     float cx = x + 0.5f, cz = y + 0.5f;
@@ -4824,43 +5160,65 @@ static void DrawPlant3D(int x, int y) {
     BoxT(TX_CONCRETE, cx, 0.15f, cz, 0.92f, 0.30f, 0.92f, A(WHITE));
     for (int k = 0; k < 2; k++) {
         float ox = -0.22f + k * 0.44f;
-        DrawCylinder((Vector3){ cx + ox, 0.30f, cz - 0.1f }, 0.07f, 0.09f, 0.45f, 12, A((Color){ 215, 215, 220, 255 }));
-        DrawCylinder((Vector3){ cx + ox, 0.75f, cz - 0.1f }, 0.065f, 0.07f, 0.08f, 12, A((Color){ 200, 55, 50, 255 }));
-        DrawCylinder((Vector3){ cx + ox, 0.83f, cz - 0.1f }, 0.06f, 0.065f, 0.10f, 12, A((Color){ 235, 235, 238, 255 }));
+        GCylinder((Vector3){ cx + ox, 0.30f, cz - 0.1f }, 0.07f, 0.09f, 0.45f, 12, A((Color){ 215, 215, 220, 255 }));
+        GCylinder((Vector3){ cx + ox, 0.75f, cz - 0.1f }, 0.065f, 0.07f, 0.08f, 12, A((Color){ 200, 55, 50, 255 }));
+        GCylinder((Vector3){ cx + ox, 0.83f, cz - 0.1f }, 0.06f, 0.065f, 0.10f, 12, A((Color){ 235, 235, 238, 255 }));
     }
-    DrawCylinder((Vector3){ cx, 0.30f, cz + 0.22f }, 0.15f, 0.20f, 0.30f, 20, A((Color){ 190, 190, 188, 255 }));   // cooling tower
+    GCylinder((Vector3){ cx, 0.30f, cz + 0.22f }, 0.15f, 0.20f, 0.30f, 20, A((Color){ 190, 190, 188, 255 }));   // cooling tower
     for (int k = 0; k < 3; k++) BoxC(cx - 0.3f + k * 0.18f, 0.34f, cz + 0.38f, 0.1f, 0.08f, 0.06f, A((Color){ 120, 125, 135, 255 }));
 }
 static void DrawWorks3D(int x, int y) {
     float cx = x + 0.5f, cz = y + 0.5f;
     BoxT(TX_CONCRETE, cx, 0.12f, cz, 0.92f, 0.24f, 0.92f, A((Color){ 190, 225, 235, 255 }));
-    DrawCylinder((Vector3){ cx - 0.2f, 0.24f, cz }, 0.22f, 0.22f, 0.20f, 20, A((Color){ 70, 150, 175, 255 }));
-    DrawCylinder((Vector3){ cx + 0.25f, 0.24f, cz - 0.2f }, 0.04f, 0.05f, 0.45f, 10, A((Color){ 180, 185, 190, 255 }));
-    DrawSphere((Vector3){ cx + 0.25f, 0.72f, cz - 0.2f }, 0.14f, A((Color){ 70, 150, 200, 255 }));        // water tower
+    GCylinder((Vector3){ cx - 0.2f, 0.24f, cz }, 0.22f, 0.22f, 0.20f, 20, A((Color){ 70, 150, 175, 255 }));
+    GCylinder((Vector3){ cx + 0.25f, 0.24f, cz - 0.2f }, 0.04f, 0.05f, 0.45f, 10, A((Color){ 180, 185, 190, 255 }));
+    GSphere((Vector3){ cx + 0.25f, 0.72f, cz - 0.2f }, 0.14f, A((Color){ 70, 150, 200, 255 }));        // water tower
     BoxC(cx + 0.2f, 0.28f, cz + 0.26f, 0.3f, 0.04f, 0.3f, A((Color){ 70, 120, 200, 255 }));
     if (smartCity) FlatSolar(cx + 0.2f, cz + 0.26f, 0.315f, 1, 1, 0, 0, 0.26f, 0.22f, 10.0f);
 }
 
-static void DrawStructure3D(int x, int y) {
+// static buildings and grounds (baked)
+static void DrawStructureStatic3D(int x, int y) {
     switch (surface[y][x]) {
         case T_BUILDING: if (bType[y][x] == B_IND) DrawIndustrial3D(x, y); else DrawBuilding3D(x, y); break;
         case T_HOUSE:    DrawHouse3D(x, y); break;
         case T_MALL:     DrawMall3D(x, y); break;
         case T_RUIN:     DrawRuin3D(x, y); break;
-        case T_FIRE_STN: DrawStation3D(x, y, true); break;
-        case T_POLICE_STN: DrawStation3D(x, y, false); break;
-        case T_POWER:    if (smartCity) DrawBattery3D(x, y); else DrawPlant3D(x, y); break;
-        case T_HOSPITAL: DrawHospital3D(x, y); break;
+        case T_POWER:    if (!smartCity) DrawPlant3D(x, y); break;
         case T_WATER:    DrawWorks3D(x, y); break;
-        case T_LANDFILL: if (IsRecycleTile(x, y) && !gateTile[y][x]) DrawRecycle3D(x, y); else DrawLandfill3D(x, y); break;
+        case T_LANDFILL: if (!(IsRecycleTile(x, y) && !gateTile[y][x])) DrawLandfill3D(x, y); break;
         case T_PARK:     DrawParkingLot3D(x, y); break;
         default: break;
     }
 }
-
+// things that move, light up or change with the simulation (drawn every frame)
+static void DrawStructureLive3D(int x, int y) {
+    switch (surface[y][x]) {
+        case T_BUILDING: if (bType[y][x] != B_IND) DrawBuildingLive3D(x, y); break;
+        case T_HOUSE:    DrawHouseDrive3D(x, y); break;
+        case T_PARK:     DrawParkingLive3D(x, y); break;
+        case T_FIRE_STN: DrawStation3D(x, y, true); break;
+        case T_POLICE_STN: DrawStation3D(x, y, false); break;
+        case T_POWER:    if (smartCity) DrawBattery3D(x, y); break;
+        case T_HOSPITAL: DrawHospital3D(x, y); break;
+        case T_LANDFILL: if (IsRecycleTile(x, y) && !gateTile[y][x]) DrawRecycle3D(x, y); else DrawLandfillMounds3D(x, y); break;
+        default: break;
+    }
+}
 // ---------------------------------------------------------------------------
 // 3D drawing - fences, gates, traffic lights, junction furniture
 // ---------------------------------------------------------------------------
+// fence segments: each edge runs on its own line 0.17 in from the tile edge. An end that meets a
+// fence on the same line runs to the tile edge; an end at a corner stops at the corner, so the
+// segments meet and never run through each other.
+static float FenceEnd(int x, int y, int z, int d, int sgn) {
+    int tx = DY[d] * sgn, ty = -DX[d] * sgn;                       // tangent (local +x is (DY,-DX))
+    int nx = x + tx, ny = y + ty;
+    if (!InBounds(nx, ny) || zone[ny][nx] != z) return 0.33f;      // corner or free end
+    int ox = nx + DX[d], oy = ny + DY[d];
+    bool sameLine = !(InBounds(ox, oy) && zone[oy][ox] == z);      // the neighbour's own edge on this side is fenced too
+    return sameLine ? 0.5f : 0.33f;
+}
 static void DrawFences3D(void) {
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) {
@@ -4871,35 +5229,58 @@ static void DrawFences3D(void) {
                 int nx = x + DX[d], ny = y + DY[d];
                 if (InBounds(nx, ny) && zone[ny][nx] == z) continue;
                 bool gate = gateTile[y][x] && IsRoad(nx, ny);
-                float inset = 0.5f - 0.17f;
+                float inset = 0.33f;
                 PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(d));
                 if (gate) {
                     Color pil = A((Color){ 150, 140, 125, 255 });
                     for (int s = -1; s <= 1; s += 2) {
-                        BoxT(TX_BRICK, s * 0.30f, 0.10f, inset, 0.07f, 0.20f, 0.07f, A(WHITE));
-                        BoxC(s * 0.30f, 0.205f, inset, 0.09f, 0.012f, 0.09f, pil);
-                        if (NightNow()) DrawSphere((Vector3){ s * 0.30f, 0.23f, inset }, 0.018f, (Color){ 255, 235, 160, 255 });
+                        BoxT(TX_BRICK, s * 0.30f, 0.11f, inset, 0.07f, 0.22f, 0.07f, A(WHITE));
+                        BoxC(s * 0.30f, 0.225f, inset, 0.09f, 0.012f, 0.09f, pil);
                     }
                     BoxC(-0.26f, 0.09f, inset, 0.16f, 0.012f, 0.012f, A((Color){ 235, 190, 40, 255 }));          // gate leaves (open)
                     BoxC(-0.26f, 0.05f, inset, 0.16f, 0.012f, 0.012f, A((Color){ 235, 190, 40, 255 }));
-                    BoxC(0.0f, 0.05f, inset, 0.50f, 0.01f, 0.01f, A(((int)(GetTime() * 1.0) % 2) ? RED : WHITE));   // barrier arm
-                    BoxC(0.0f, 0.03f, inset, 0.01f, 0.06f, 0.01f, A(DARKGRAY));
-                } else if (picket) {
-                    BoxC(0, 0.040f, inset, 1.0f, 0.012f, 0.010f, A(WHITE));
-                    BoxC(0, 0.070f, inset, 1.0f, 0.012f, 0.010f, A(WHITE));
-                    for (int k = 0; k < 9; k++) BoxC(-0.48f + k * 0.12f, 0.050f, inset, 0.022f, 0.10f, 0.010f, A((Color){ 248, 248, 244, 255 }));
+                    BoxC(0.0f, 0.03f, inset, 0.01f, 0.06f, 0.01f, A(DARKGRAY));                                    // barrier post (arm is live)
                 } else {
-                    Color post = A((Color){ 90, 94, 100, 255 });
-                    for (int k = 0; k < 3; k++) BoxC(-0.5f + k * 0.5f, 0.07f, inset, 0.015f, 0.14f, 0.015f, post);
-                    BoxC(0, 0.075f, inset, 1.0f, 0.10f, 0.004f, A((Color){ 175, 180, 188, 130 }));
-                    BoxC(0, 0.14f, inset, 1.0f, 0.008f, 0.008f, post);
-                    BoxC(0, 0.155f, inset, 1.0f, 0.004f, 0.004f, A((Color){ 60, 60, 64, 255 }));
+                    float eL = FenceEnd(x, y, z, d, -1), eR = FenceEnd(x, y, z, d, 1);
+                    float len = eL + eR, xc = (eR - eL) * 0.5f;
+                    if (picket) {
+                        int n = (int)(len / 0.11f + 0.5f); if (n < 2) n = 2;
+                        BoxC(xc, 0.070f, inset, len, 0.012f, 0.010f, A(WHITE));
+                        BoxC(xc, 0.130f, inset, len, 0.012f, 0.010f, A(WHITE));
+                        for (int k = 0; k < n; k++) BoxC(-eL + k * len / (n - 1), 0.080f, inset, 0.022f, 0.16f, 0.010f, A((Color){ 248, 248, 244, 255 }));
+                    } else {
+                        Color post = A((Color){ 90, 94, 100, 255 });
+                        BoxC(-eL, 0.11f, inset, 0.016f, 0.22f, 0.016f, post);
+                        BoxC( eR, 0.11f, inset, 0.016f, 0.22f, 0.016f, post);
+                        BoxC(xc, 0.11f, inset, 0.016f, 0.22f, 0.016f, post);
+                        BoxC(xc, 0.115f, inset, len, 0.19f, 0.004f, A((Color){ 175, 180, 188, 150 }));           // panel
+                        BoxC(xc, 0.225f, inset, len, 0.008f, 0.008f, post);                                      // top rail
+                        BoxC(xc, 0.232f, inset, len, 0.004f, 0.004f, A((Color){ 60, 60, 64, 255 }));
+                    }
                 }
                 PopFrame();
             }
         }
 }
 
+// the gate barrier and its lamps (live)
+static void DrawFencesLive3D(void) {
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) {
+            int z = zone[y][x];
+            if (!ZoneFenced(z) || !gateTile[y][x]) continue;
+            for (int d = 0; d < 4; d++) {
+                int nx = x + DX[d], ny = y + DY[d];
+                if (!(InBounds(nx, ny) && zone[ny][nx] != z && IsRoad(nx, ny))) continue;
+                PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(d));
+                float inset = 0.33f;
+                for (int s = -1; s <= 1; s += 2)
+                    if (NightNow()) GSphere(V3(s * 0.30f, 0.23f, inset), 0.018f, (Color){ 255, 235, 160, 255 });
+                BoxC(0.0f, 0.05f, inset, 0.50f, 0.01f, 0.01f, A(((int)(GetTime() * 1.0) % 2) ? RED : WHITE));   // barrier arm
+                PopFrame();
+            }
+        }
+}
 static void DrawSignalHead(float cx, float cz, float yaw, int state) {
     PushFrame(cx, 0, cz, yaw);
     BoxC(0, 0.09f, 0, 0.014f, 0.18f, 0.014f, A((Color){ 60, 62, 68, 255 }));
@@ -4907,32 +5288,26 @@ static void DrawSignalHead(float cx, float cz, float yaw, int state) {
     Color r = (state == 0) ? (Color){ 255, 50, 40, 255 } : (Color){ 70, 15, 15, 255 };
     Color y = (state == 2) ? (Color){ 255, 205, 40, 255 } : (Color){ 70, 55, 10, 255 };
     Color g = (state == 1) ? (Color){ 60, 255, 100, 255 } : (Color){ 12, 60, 25, 255 };
-    DrawSphere((Vector3){ 0, 0.235f, 0.030f }, 0.011f, A(r));
-    DrawSphere((Vector3){ 0, 0.205f, 0.030f }, 0.011f, A(y));
-    DrawSphere((Vector3){ 0, 0.175f, 0.030f }, 0.011f, A(g));
+    GSphere((Vector3){ 0, 0.235f, 0.030f }, 0.011f, A(r));
+    GSphere((Vector3){ 0, 0.205f, 0.030f }, 0.011f, A(y));
+    GSphere((Vector3){ 0, 0.175f, 0.030f }, 0.011f, A(g));
     PopFrame();
 }
 
+// roundabouts and stop signs (static); traffic-signal heads are live
 static void DrawJunction3D(int x, int y, bool xray) {
     float cx = x + 0.5f, cz = y + 0.5f;
     if (ctrl[y][x] == C_ROUNDABOUT) {
-        DrawCylinder((Vector3){ cx, 0.058f, cz }, 0.41f, 0.41f, 0.004f, 36, A((Color){ 190, 190, 192, 255 }));
-        DrawCylinder((Vector3){ cx, 0.061f, cz }, 0.37f, 0.37f, 0.004f, 36, A(xray ? COL_ROAD_DIM : COL_ROAD));
-        DrawCylinder((Vector3){ cx, 0.06f, cz }, 0.215f, 0.215f, 0.05f, 28, A((Color){ 160, 160, 162, 255 }));
-        DrawCylinder((Vector3){ cx, 0.11f, cz }, 0.20f, 0.20f, 0.02f, 28, A((Color){ 70, 140, 65, 255 }));
-        DrawSphere((Vector3){ cx + 0.05f, 0.17f, cz }, 0.07f, A((Color){ 48, 125, 55, 255 }));
-        DrawSphere((Vector3){ cx - 0.06f, 0.16f, cz + 0.05f }, 0.055f, A((Color){ 62, 145, 62, 255 }));
+        GCylinder(V3(cx, 0.058f, cz), 0.41f, 0.41f, 0.004f, 36, A((Color){ 190, 190, 192, 255 }));
+        GCylinder(V3(cx, 0.061f, cz), 0.37f, 0.37f, 0.004f, 36, A(xray ? COL_ROAD_DIM : COL_ROAD));
+        GCylinder(V3(cx, 0.06f, cz), 0.215f, 0.215f, 0.05f, 28, A((Color){ 160, 160, 162, 255 }));
+        GCylinder(V3(cx, 0.11f, cz), 0.20f, 0.20f, 0.02f, 28, A((Color){ 70, 140, 65, 255 }));
+        GSphere(V3(cx + 0.05f, 0.17f, cz), 0.07f, A((Color){ 48, 125, 55, 255 }));
+        GSphere(V3(cx - 0.06f, 0.16f, cz + 0.05f), 0.055f, A((Color){ 62, 145, 62, 255 }));
         for (int k = 0; k < 6; k++) {
             float a = k * PI / 3.0f;
-            DrawSphere((Vector3){ cx + 0.13f * cosf(a), 0.15f, cz + 0.13f * sinf(a) }, 0.016f, A(k & 1 ? (Color){ 240, 90, 120, 255 } : (Color){ 250, 215, 70, 255 }));
+            GSphere(V3(cx + 0.13f * cosf(a), 0.15f, cz + 0.13f * sinf(a)), 0.016f, A(k & 1 ? (Color){ 240, 90, 120, 255 } : (Color){ 250, 215, 70, 255 }));
         }
-    } else if (ctrl[y][x] == C_SIGNAL) {
-        // pole at each corner, head facing the traffic that approaches it
-        static const float px[4] = { -0.45f, 0.45f, 0.45f, -0.45f };
-        static const float pz[4] = { -0.45f, -0.45f, 0.45f, 0.45f };
-        static const float yaw[4] = { -90.0f, 180.0f, 90.0f, 0.0f };
-        static const int axisOf[4] = { 1, 0, 1, 0 };
-        for (int i = 0; i < 4; i++) DrawSignalHead(cx + px[i], cz + pz[i], yaw[i], SigState(x, y, axisOf[i], NULL));
     } else if (ctrl[y][x] == C_STOP) {
         static const float px[4] = { -0.45f, 0.45f, 0.45f, -0.45f };
         static const float pz[4] = { -0.45f, -0.45f, 0.45f, 0.45f };
@@ -4940,15 +5315,25 @@ static void DrawJunction3D(int x, int y, bool xray) {
         for (int i = 0; i < 4; i++) {
             PushFrame(cx + px[i], 0, cz + pz[i], yaw[i]);
             BoxC(0, 0.08f, 0, 0.010f, 0.16f, 0.010f, A((Color){ 150, 150, 155, 255 }));
-            rlPushMatrix(); rlTranslatef(0, 0.18f, 0.008f); rlRotatef(90.0f, 1, 0, 0);
-            DrawCylinder((Vector3){ 0, 0, 0 }, 0.038f, 0.038f, 0.006f, 8, A(RED));
-            rlPopMatrix();
+            GXPush(); GXTrans(0, 0.18f, 0.008f); GXRot(90.0f, 1, 0, 0);
+            GCylinder(V3(0, 0, 0), 0.038f, 0.038f, 0.006f, 8, A(RED));
+            GXPop();
             BoxC(0, 0.18f, 0.012f, 0.040f, 0.008f, 0.002f, A(WHITE));
             PopFrame();
         }
     }
 }
 
+// traffic-signal heads (live: they change colour)
+static void DrawJunctionLive3D(int x, int y) {
+    if (ctrl[y][x] != C_SIGNAL) return;
+    float cx = x + 0.5f, cz = y + 0.5f;
+    static const float px[4] = { -0.45f, 0.45f, 0.45f, -0.45f };
+    static const float pz[4] = { -0.45f, -0.45f, 0.45f, 0.45f };
+    static const float yaw[4] = { -90.0f, 180.0f, 90.0f, 0.0f };
+    static const int axisOf[4] = { 1, 0, 1, 0 };
+    for (int i = 0; i < 4; i++) DrawSignalHead(cx + px[i], cz + pz[i], yaw[i], SigState(x, y, axisOf[i], NULL));
+}
 // zebra crossings, stop lines
 static void DrawRoadMarkings3D(int x, int y) {
     float cx = x + 0.5f, cz = y + 0.5f;
@@ -4976,9 +5361,9 @@ static void DrawRoadMarkings3D(int x, int y) {
 // hospital, recycling plant, battery storage, road monitors, renewable farm
 // ---------------------------------------------------------------------------
 static void SolarPanel(float x, float y, float z, float w, float d, float tilt) {
-    rlPushMatrix(); rlTranslatef(x, y, z); rlRotatef(tilt, 1, 0, 0);
+    GXPush(); GXTrans(x, y, z); GXRot(tilt, 1, 0, 0);
     BoxT(TX_SOLAR, 0, 0, 0, w, 0.008f, d, A(WHITE));
-    rlPopMatrix();
+    GXPop();
 }
 
 static void FlatSolar(float cx, float cz, float y, int nx, int nz, float gx, float gz, float pw, float pd, float tilt) {
@@ -4996,20 +5381,19 @@ static void GableSolar(bool alongZ, float a, float y0, float h, float s0, float 
     Quad3T(TX_SOLAR, p0, p1, p2, p3, A(WHITE), L * 2.0f / 0.07f, (s1 - s0) / 0.07f);
 }
 
+// roof panels in the house's roof frame (origin = centre of the roof, see DrawHouse3D)
 static void HouseSolar3D(int rtype) {
-    if (rtype == 0)      GableSolar(false, 0.20f, 0.20f, 0.12f, 0.05f, 0.17f, 0.14f);
-    else if (rtype == 1) GableSolar(true,  0.20f, 0.20f, 0.13f, 0.05f, 0.17f, 0.14f);
-    else if (rtype == 2) {
-        float ya = 0.20f + 0.12f * (1.0f - 0.04f / 0.19f) + 0.004f, yb = 0.20f + 0.12f * (1.0f - 0.12f / 0.19f) + 0.004f;
-        Quad3T(TX_SOLAR, (Vector3){ -0.12f, ya, 0.04f }, (Vector3){ -0.06f, yb, 0.12f }, (Vector3){ 0.06f, yb, 0.12f }, (Vector3){ 0.12f, ya, 0.04f }, A(WHITE), 3.0f, 1.2f);
-    } else FlatSolar(-0.05f, -0.08f, 0.245f, 2, 1, 0.19f, 0.0f, 0.16f, 0.15f, 12.0f);
+    if (rtype == 0)      GableSolar(false, HS_L * 0.5f, HS_WH, HS_RH, 0.04f, 0.16f, HS_W * 0.5f - 0.03f);
+    else if (rtype == 1) GableSolar(true,  HS_W * 0.5f, HS_WH, HS_RH, 0.04f, 0.16f, HS_L * 0.5f - 0.03f);
+    else if (rtype == 2) GableSolar(false, HS_L * 0.5f, HS_WH, HS_RH, 0.06f, 0.16f, 0.05f);
+    else                 FlatSolar(0.0f, 0.0f, HS_WH + 0.030f, 2, 1, 0.19f, 0.0f, 0.16f, 0.14f, 12.0f);
 }
-
+// vertical gardens: a planter ledge with hedge and flowers every other floor, plus climbing plants at the corners
 // vertical gardens: a planter ledge with hedge and flowers every other floor, plus climbing plants at the corners
 static void LivingWall(float y0, int floors, float w, int startF) {
     float o = w * 0.5f + 0.012f;
     for (int f = startF; f < floors; f += 2) {
-        float y = y0 + f * 0.1f;
+        float y = y0 + f * FLOOR_H;
         BoxC(0, y, 0, w + 0.05f, 0.016f, w + 0.05f, A((Color){ 150, 152, 148, 255 }));
         BoxT(TX_HEDGE, 0, y + 0.03f,  o + 0.012f, w + 0.05f, 0.05f, 0.045f, A(WHITE));
         BoxT(TX_HEDGE, 0, y + 0.03f, -o - 0.012f, w + 0.05f, 0.05f, 0.045f, A(WHITE));
@@ -5018,33 +5402,32 @@ static void LivingWall(float y0, int floors, float w, int startF) {
         if ((f / 2) % 2 == 0) {
             for (int k = 0; k < 4; k++) {
                 Color fc = (k + f) & 1 ? (Color){ 245, 120, 160, 255 } : (Color){ 250, 225, 90, 255 };
-                DrawSphere((Vector3){ -w * 0.35f + k * w * 0.23f, y + 0.062f, o + 0.03f }, 0.011f, A(fc));
-                DrawSphere((Vector3){ o + 0.03f, y + 0.062f, -w * 0.35f + k * w * 0.23f }, 0.011f, A(fc));
+                GSphere(V3(-w * 0.35f + k * w * 0.23f, y + 0.062f, o + 0.03f), 0.011f, A(fc));
+                GSphere(V3(o + 0.03f, y + 0.062f, -w * 0.35f + k * w * 0.23f), 0.011f, A(fc));
             }
         }
     }
-    float hh = floors * 0.1f;
+    float hh = floors * FLOOR_H;
     for (int sx = -1; sx <= 1; sx += 2)
         for (int sz = -1; sz <= 1; sz += 2)
             BoxT(TX_HEDGE, sx * (w * 0.5f + 0.004f), y0 + hh * 0.5f, sz * (w * 0.5f + 0.004f), 0.032f, hh, 0.032f, A(WHITE));
 }
-
 static void RooftopGarden3D(float h) {          // on the crown of a skyrise
     BoxT(TX_HEDGE, -0.22f, h + 0.062f, -0.20f, 0.15f, 0.04f, 0.15f, A(WHITE));
     BoxT(TX_HEDGE,  0.21f, h + 0.062f, -0.20f, 0.12f, 0.04f, 0.15f, A(WHITE));
     BoxT(TX_HEDGE, -0.22f, h + 0.062f,  0.22f, 0.15f, 0.04f, 0.12f, A(WHITE));
-    DrawSphere((Vector3){ -0.22f, h + 0.115f, -0.20f }, 0.045f, A((Color){ 60, 150, 62, 255 }));
-    DrawSphere((Vector3){  0.21f, h + 0.105f, -0.20f }, 0.038f, A((Color){ 75, 165, 70, 255 }));
+    GSphere((Vector3){ -0.22f, h + 0.115f, -0.20f }, 0.045f, A((Color){ 60, 150, 62, 255 }));
+    GSphere((Vector3){  0.21f, h + 0.105f, -0.20f }, 0.038f, A((Color){ 75, 165, 70, 255 }));
 }
 
 // flue-gas scrubber + baghouse beside a factory chimney
 static void SmokeTrap3D(float h) {
-    DrawCylinder((Vector3){ 0.24f, h, 0.06f }, 0.075f, 0.075f, 0.30f, 14, A((Color){ 70, 150, 150, 255 }));
-    DrawCylinder((Vector3){ 0.24f, h + 0.30f, 0.06f }, 0.0f, 0.075f, 0.05f, 14, A((Color){ 55, 118, 122, 255 }));
+    GCylinder((Vector3){ 0.24f, h, 0.06f }, 0.075f, 0.075f, 0.30f, 14, A((Color){ 70, 150, 150, 255 }));
+    GCylinder((Vector3){ 0.24f, h + 0.30f, 0.06f }, 0.0f, 0.075f, 0.05f, 14, A((Color){ 55, 118, 122, 255 }));
     BoxC(0.24f, h + 0.19f, -0.07f, 0.030f, 0.030f, 0.30f, A((Color){ 110, 116, 122, 255 }));          // duct into the stack
     BoxC(0.36f, h + 0.07f, 0.06f, 0.07f, 0.14f, 0.10f, A((Color){ 185, 190, 195, 255 }));             // baghouse filter
-    DrawCylinder((Vector3){ 0.24f, h + 0.44f, -0.20f }, 0.052f, 0.052f, 0.022f, 12, A((Color){ 80, 215, 130, 255 }));   // "clean" cap
-    DrawSphere((Vector3){ 0.31f, h + 0.22f, 0.06f }, 0.010f, (Color){ 70, 255, 120, 255 });
+    GCylinder((Vector3){ 0.24f, h + 0.44f, -0.20f }, 0.052f, 0.052f, 0.022f, 12, A((Color){ 80, 215, 130, 255 }));   // "clean" cap
+    GSphere((Vector3){ 0.31f, h + 0.22f, 0.06f }, 0.010f, (Color){ 70, 255, 120, 255 });
 }
 
 // ---- drones ------------------------------------------------------------------
@@ -5052,23 +5435,23 @@ static void DrawDroneModel(int kind, float spinDeg, bool carrying) {
     Color body = (kind == D_FIRE) ? (Color){ 215, 62, 52, 255 } : (kind == D_PARCEL ? (Color){ 250, 170, 50, 255 } : (Color){ 245, 247, 250, 255 });
     Color dark = (Color){ 40, 42, 48, 255 };
     BoxC(0, 0, 0, 0.075f, 0.026f, 0.075f, A(body));
-    for (int k = 0; k < 2; k++) { rlPushMatrix(); rlRotatef(45.0f + 90.0f * k, 0, 1, 0); BoxC(0, 0.004f, 0, 0.20f, 0.010f, 0.012f, A(dark)); rlPopMatrix(); }
+    for (int k = 0; k < 2; k++) { GXPush(); GXRot(45.0f + 90.0f * k, 0, 1, 0); BoxC(0, 0.004f, 0, 0.20f, 0.010f, 0.012f, A(dark)); GXPop(); }
     for (int sx = -1; sx <= 1; sx += 2)
         for (int sz = -1; sz <= 1; sz += 2) {
             float px = sx * 0.07f, pz = sz * 0.07f;
-            DrawCylinder((Vector3){ px, 0.012f, pz }, 0.040f, 0.040f, 0.004f, 10, Fade(WHITE, 0.16f * gAlpha));
-            rlPushMatrix(); rlTranslatef(px, 0.018f, pz); rlRotatef(spinDeg, 0, 1, 0);
+            GCylinder((Vector3){ px, 0.012f, pz }, 0.040f, 0.040f, 0.004f, 10, Fade(WHITE, 0.16f * gAlpha));
+            GXPush(); GXTrans(px, 0.018f, pz); GXRot(spinDeg, 0, 1, 0);
             BoxC(0, 0, 0, 0.085f, 0.003f, 0.010f, A(dark));
-            rlRotatef(90.0f, 0, 1, 0); BoxC(0, 0, 0, 0.085f, 0.003f, 0.010f, A(dark));
-            rlPopMatrix();
+            GXRot(90.0f, 0, 1, 0); BoxC(0, 0, 0, 0.085f, 0.003f, 0.010f, A(dark));
+            GXPop();
         }
     bool flash = ((int)(GetTime() * 6.0)) & 1;
     if (kind == D_POLICE) {
         BoxC(-0.016f, 0.020f, 0, 0.026f, 0.012f, 0.024f, flash ? (Color){ 255, 40, 40, 255 } : (Color){ 90, 15, 15, 255 });
         BoxC( 0.016f, 0.020f, 0, 0.026f, 0.012f, 0.024f, flash ? (Color){ 20, 40, 110, 255 } : (Color){ 80, 170, 255, 255 });
-        DrawSphere((Vector3){ 0, -0.024f, 0.014f }, 0.014f, A((Color){ 25, 28, 34, 255 }));                // camera
+        GSphere((Vector3){ 0, -0.024f, 0.014f }, 0.014f, A((Color){ 25, 28, 34, 255 }));                // camera
     } else if (kind == D_FIRE) {
-        DrawCylinder((Vector3){ 0, -0.052f, 0 }, 0.026f, 0.026f, 0.040f, 10, A((Color){ 235, 235, 238, 255 }));   // water tank
+        GCylinder((Vector3){ 0, -0.052f, 0 }, 0.026f, 0.026f, 0.040f, 10, A((Color){ 235, 235, 238, 255 }));   // water tank
         BoxC(0, -0.060f, 0.040f, 0.010f, 0.010f, 0.045f, A(dark));                                        // nozzle
         BoxC(0, 0.018f, 0, 0.030f, 0.008f, 0.012f, flash ? (Color){ 255, 190, 40, 255 } : (Color){ 110, 80, 10, 255 });
     } else if (kind == D_PARCEL || kind == D_MEDSUP) {                                                      // delivery drones
@@ -5096,31 +5479,31 @@ static void DrawDroneModel(int kind, float spinDeg, bool carrying) {
 
 static void DrawDrone3D(const Drone *d, double t) {
     float spin = fmodf((float)t * 1500.0f, 360.0f);
-    DrawCylinder((Vector3){ d->x, 0.074f, d->y }, 0.07f + d->z * 0.012f, 0.07f + d->z * 0.012f, 0.002f, 12, (Color){ 0, 0, 0, (unsigned char)Clamp(95.0f - d->z * 14.0f, 25.0f, 95.0f) });
+    GCylinder((Vector3){ d->x, 0.074f, d->y }, 0.07f + d->z * 0.012f, 0.07f + d->z * 0.012f, 0.002f, 12, (Color){ 0, 0, 0, (unsigned char)Clamp(95.0f - d->z * 14.0f, 25.0f, 95.0f) });
     PushFrame(d->x, d->z, d->y, d->yaw);
-    rlScalef(1.35f, 1.35f, 1.35f);
+    GXScale(1.35f, 1.35f, 1.35f);
     DrawDroneModel(d->kind, spin, d->carrying);
     PopFrame();
     if (d->spraying) {
         Vector3 a = { d->x, d->z - 0.05f, d->y }, b = { d->sx, 0.10f, d->sy };
         if (d->kind == D_FIRE) {
             b.y += 0.06f * sinf((float)t * 12.0f);
-            DrawCylinderEx(a, b, 0.010f, 0.030f, 6, (Color){ 140, 200, 255, 170 });
-            DrawSphere(b, 0.07f, (Color){ 200, 230, 255, 120 });
+            GCylinderEx(a, b, 0.010f, 0.030f, 6, (Color){ 140, 200, 255, 170 });
+            GSphere(b, 0.07f, (Color){ 200, 230, 255, 120 });
         } else if (d->kind == D_POLICE) {
-            DrawCylinderEx(a, b, 0.006f, 0.075f, 8, (Color){ 255, 250, 205, 55 });                          // spotlight beam
+            GCylinderEx(a, b, 0.006f, 0.075f, 8, (Color){ 255, 250, 205, 55 });                          // spotlight beam
         }
     }
 }
 
 // parked drone sitting on a roof pad
 static void DrawPad3D(float x, float y, float z, int kind, bool drone) {
-    DrawCylinder((Vector3){ x, y, z }, 0.13f, 0.13f, 0.010f, 20, A((Color){ 52, 56, 64, 255 }));
-    DrawCylinder((Vector3){ x, y + 0.010f, z }, 0.11f, 0.11f, 0.002f, 20, A((Color){ 250, 205, 40, 255 }));
-    DrawCylinder((Vector3){ x, y + 0.012f, z }, 0.095f, 0.095f, 0.002f, 20, A((Color){ 52, 56, 64, 255 }));
+    GCylinder((Vector3){ x, y, z }, 0.13f, 0.13f, 0.010f, 20, A((Color){ 52, 56, 64, 255 }));
+    GCylinder((Vector3){ x, y + 0.010f, z }, 0.11f, 0.11f, 0.002f, 20, A((Color){ 250, 205, 40, 255 }));
+    GCylinder((Vector3){ x, y + 0.012f, z }, 0.095f, 0.095f, 0.002f, 20, A((Color){ 52, 56, 64, 255 }));
     BoxC(x, y + 0.016f, z, 0.07f, 0.004f, 0.012f, A((Color){ 250, 250, 250, 255 }));
     BoxC(x, y + 0.016f, z, 0.012f, 0.004f, 0.07f, A((Color){ 250, 250, 250, 255 }));
-    if (drone) { PushFrame(x, y + 0.05f, z, 0.0f); rlScalef(1.2f, 1.2f, 1.2f); DrawDroneModel(kind, 0.0f, false); PopFrame(); }
+    if (drone) { PushFrame(x, y + 0.05f, z, 0.0f); GXScale(1.2f, 1.2f, 1.2f); DrawDroneModel(kind, 0.0f, false); PopFrame(); }
 }
 static bool PadBusy(int hx, int hy) {
     for (int i = 0; i < MAX_DRONES; i++) if (drones[i].active && drones[i].homeX == hx && drones[i].homeY == hy) return true;
@@ -5185,7 +5568,7 @@ static void DrawBattery3D(int x, int y) {
             BoxC(px, 0.27f, pz, 0.38f, 0.014f, 0.30f, A((Color){ 90, 120, 105, 255 }));
             for (int s = 0; s < 5; s++) BoxC(px - 0.12f + s * 0.06f, 0.15f, pz + 0.142f, 0.03f, 0.10f, 0.004f, A((Color){ 60, 215, 120, 255 }));
         }
-    DrawCylinder((Vector3){ cx - 0.35f, 0.04f, cz + 0.36f }, 0.06f, 0.06f, 0.14f, 10, A((Color){ 170, 175, 182, 255 }));   // transformer
+    GCylinder((Vector3){ cx - 0.35f, 0.04f, cz + 0.36f }, 0.06f, 0.06f, 0.14f, 10, A((Color){ 170, 175, 182, 255 }));   // transformer
     BoxC(cx + 0.25f, 0.12f, cz + 0.37f, 0.30f, 0.16f, 0.10f, A((Color){ 140, 150, 160, 255 }));                          // inverters
     float fill = Clamp(batteryPct / 100.0f, 0.0f, 1.0f);                                                                  // charge gauge
     BoxC(cx + 0.42f, 0.34f, cz, 0.04f, 0.60f, 0.04f, A((Color){ 40, 44, 50, 255 }));
@@ -5196,7 +5579,7 @@ static void DrawBattery3D(int x, int y) {
 
 // ---- recycling plant (part of the old landfill site) -------------------------------
 static void RecycleSign3D(float cx, float y, float cz) {
-    DrawCylinder((Vector3){ cx, y, cz }, 0.17f, 0.17f, 0.012f, 24, A((Color){ 40, 160, 90, 255 }));
+    GCylinder((Vector3){ cx, y, cz }, 0.17f, 0.17f, 0.012f, 24, A((Color){ 40, 160, 90, 255 }));
     for (int k = 0; k < 3; k++) {
         PushFrame(cx, y + 0.014f, cz, k * 120.0f + (float)GetTime() * 20.0f);
         BoxC(0.08f, 0, 0, 0.09f, 0.008f, 0.026f, A((Color){ 245, 250, 245, 255 }));
@@ -5211,11 +5594,11 @@ static void DrawRecycle3D(int x, int y) {
     static const Color bale[5] = { {70,110,190,255}, {190,195,202,255}, {205,170,110,255}, {85,160,95,255}, {225,225,120,255} };
     if (x == 20 && y == 11) {                                         // main sorting hall
         BoxT(TX_CORRUG, cx, 0.20f, cz, 0.94f, 0.40f, 0.86f, A((Color){ 190, 235, 210, 255 }));
-        for (int k = 0; k < 3; k++) { rlPushMatrix(); rlTranslatef(cx - 0.31f + k * 0.31f, 0, cz); RoofGable(0.30f, 0.86f, 0.40f, 0.07f, true, A((Color){ 60, 150, 110, 255 }), TX_CORRUG, A((Color){ 200, 230, 215, 255 })); rlPopMatrix(); }
+        for (int k = 0; k < 3; k++) { GXPush(); GXTrans(cx - 0.31f + k * 0.31f, 0, cz); RoofGable(0.30f, 0.86f, 0.40f, 0.07f, true, A((Color){ 60, 150, 110, 255 }), TX_CORRUG, A((Color){ 200, 230, 215, 255 })); GXPop(); }
         BoxC(cx, 0.30f, cz + 0.436f, 0.94f, 0.06f, 0.012f, A((Color){ 40, 160, 90, 255 }));
         BoxC(cx - 0.2f, 0.10f, cz + 0.436f, 0.28f, 0.18f, 0.012f, A((Color){ 80, 95, 100, 255 }));
         RecycleSign3D(cx, 0.49f, cz);
-        DrawCylinder((Vector3){ cx + 0.34f, 0.40f, cz - 0.28f }, 0.035f, 0.04f, 0.20f, 10, A((Color){ 170, 175, 180, 255 }));
+        GCylinder((Vector3){ cx + 0.34f, 0.40f, cz - 0.28f }, 0.035f, 0.04f, 0.20f, 10, A((Color){ 170, 175, 180, 255 }));
         FlatSolar(cx + 0.02f, cz - 0.24f, 0.495f, 3, 1, 0.28f, 0, 0.22f, 0.16f, 10.0f);
     } else if (x == 20) {                                              // conveyor + bale presses
         BoxT(TX_CORRUG, cx - 0.05f, 0.14f, cz, 0.84f, 0.28f, 0.80f, A((Color){ 200, 220, 210, 255 }));
@@ -5251,30 +5634,30 @@ static void DrawMonitor3D(int x, int y) {
     float hx = px + ax * 0.20f, hz = pz + az * 0.20f;
     BoxC((px + hx) * 0.5f, 0.30f, (pz + hz) * 0.5f, horiz ? 0.012f : 0.20f, 0.012f, horiz ? 0.20f : 0.012f, mast);
     BoxC(hx, 0.29f, hz, 0.055f, 0.035f, 0.055f, A((Color){ 30, 38, 52, 255 }));
-    DrawSphere((Vector3){ hx, 0.268f, hz }, 0.014f, (Color){ 120, 220, 255, 255 });                  // lens
+    GSphere((Vector3){ hx, 0.268f, hz }, 0.014f, (Color){ 120, 220, 255, 255 });                  // lens
     Color rc = CongColor(traffic[y][x], 1.0f);
-    DrawCylinder((Vector3){ hx, 0.31f, hz }, 0.030f, 0.030f, 0.010f, 12, rc);                         // congestion status ring
+    GCylinder((Vector3){ hx, 0.31f, hz }, 0.030f, 0.030f, 0.010f, 12, rc);                         // congestion status ring
     SolarPanel(px, 0.325f, pz, 0.07f, 0.05f, 12.0f);
-    if (NightNow() || st.daylight < 0.7f) DrawCylinderEx((Vector3){ hx, 0.265f, hz }, (Vector3){ cx + ax * 0.45f * 0.0f, 0.07f, cz }, 0.004f, 0.10f, 8, (Color){ 120, 220, 255, 26 });
+    if (NightNow() || st.daylight < 0.7f) GCylinderEx((Vector3){ hx, 0.265f, hz }, (Vector3){ cx + ax * 0.45f * 0.0f, 0.07f, cz }, 0.004f, 0.10f, 8, (Color){ 120, 220, 255, 26 });
 }
 
 // ---- renewable farm east of the city ----------------------------------------------
 static void DrawTurbine3D(float tx, float tz, float t) {
-    DrawCylinder((Vector3){ tx, 0, tz }, 0.016f, 0.034f, 1.10f, 10, A((Color){ 235, 238, 242, 255 }));
+    GCylinder((Vector3){ tx, 0, tz }, 0.016f, 0.034f, 1.10f, 10, A((Color){ 235, 238, 242, 255 }));
     BoxC(tx - 0.02f, 1.12f, tz, 0.10f, 0.05f, 0.05f, A((Color){ 225, 228, 232, 255 }));
     float ang = t * (30.0f + 300.0f * WindFactor()) + tx * 37.0f;
-    rlPushMatrix(); rlTranslatef(tx - 0.075f, 1.12f, tz); rlRotatef(ang, 1, 0, 0);
-    DrawSphere((Vector3){ 0, 0, 0 }, 0.028f, A((Color){ 240, 242, 246, 255 }));
+    GXPush(); GXTrans(tx - 0.075f, 1.12f, tz); GXRot(ang, 1, 0, 0);
+    GSphere((Vector3){ 0, 0, 0 }, 0.028f, A((Color){ 240, 242, 246, 255 }));
     for (int k = 0; k < 3; k++) {
-        rlPushMatrix(); rlRotatef(k * 120.0f, 1, 0, 0);
+        GXPush(); GXRot(k * 120.0f, 1, 0, 0);
         BoxC(0, 0.23f, 0, 0.010f, 0.44f, 0.034f, A((Color){ 245, 247, 250, 255 }));
-        rlPopMatrix();
+        GXPop();
     }
-    rlPopMatrix();
+    GXPop();
 }
 
-static void DrawFarm3D(void) {
-    float t = (float)GetTime();
+// renewable farm, static part: ground, solar tables, grid hub, fence and power line
+static void DrawFarmStatic3D(void) {
     for (int y = 0; y < MAP_H; y++)
         for (int x = MAP_W; x < MAP_W + FARM_W; x++) {
             bool road = (y == FARM_ROAD_Y);
@@ -5292,15 +5675,13 @@ static void DrawFarm3D(void) {
                     BoxC(px, 0.045f, pz - 0.05f, 0.34f, 0.07f, 0.012f, A((Color){ 120, 124, 130, 255 }));        // rear support
                     SolarPanel(px, 0.085f, pz, 0.40f, 0.30f, 24.0f);
                 }
-    // turbines
-    for (int i = 0; i < N_TURB; i++) DrawTurbine3D(TURB_POS[i][0], TURB_POS[i][1], t);
     // grid hub: battery containers + transformer
     BoxT(TX_CONCRETE, 24.5f, 0.02f, 12.6f, 0.95f, 0.04f, 3.0f, WHITE);
     for (int k = 0; k < 3; k++) {
         BoxT(TX_CORRUG, 24.5f, 0.17f, 11.5f + k * 1.0f, 0.70f, 0.26f, 0.80f, A((Color){ 215, 240, 225, 255 }));
         for (int s = 0; s < 6; s++) BoxC(24.5f - 0.25f + s * 0.1f, 0.17f, 11.5f + k * 1.0f + 0.404f, 0.05f, 0.12f, 0.004f, A((Color){ 60, 215, 120, 255 }));
     }
-    DrawCylinder((Vector3){ 25.1f, 0.04f, 12.0f }, 0.07f, 0.07f, 0.22f, 10, A((Color){ 170, 175, 182, 255 }));
+    GCylinder(V3(25.1f, 0.04f, 12.0f), 0.07f, 0.07f, 0.22f, 10, A((Color){ 170, 175, 182, 255 }));
     // perimeter fence (north, south, east)
     Color fc = A((Color){ 150, 155, 160, 255 });
     for (int x = MAP_W; x <= MAP_W + FARM_W; x++) { BoxC((float)x, 0.06f, 0.0f, 0.012f, 0.12f, 0.012f, fc); BoxC((float)x, 0.06f, (float)MAP_H, 0.012f, 0.12f, 0.012f, fc); }
@@ -5315,7 +5696,12 @@ static void DrawFarm3D(void) {
     }
     BoxC(MAP_W + FARM_W * 0.5f - 0.5f, 0.39f, FARM_ROAD_Y + 0.05f, (float)FARM_W, 0.004f, 0.004f, A((Color){ 30, 30, 34, 255 }));
 }
-// ---------------------------------------------------------------------------
+
+// the turbines turn with the wind (live)
+static void DrawFarmLive3D(void) {
+    float t = (float)GetTime();
+    for (int i = 0; i < N_TURB; i++) DrawTurbine3D(TURB_POS[i][0], TURB_POS[i][1], t);
+}// ---------------------------------------------------------------------------
 // 3D drawing - smart city extras
 // ---------------------------------------------------------------------------
 static void GreenRoof3D(float y, float cx, float cz, float w, float d) {       // sedum blanket (local frame of the building)
@@ -5323,7 +5709,7 @@ static void GreenRoof3D(float y, float cx, float cz, float w, float d) {       /
     static const Color fl[3] = { {245,120,160,255}, {250,225,90,255}, {235,235,245,255} };
     for (int k = 0; k < 7; k++) {
         float fx = cx + ((k * 37) % 11 - 5) * w * 0.075f, fz = cz + ((k * 53) % 9 - 4) * d * 0.09f;
-        DrawSphere((Vector3){ fx, y + 0.012f, fz }, 0.009f, A(fl[k % 3]));
+        GSphere((Vector3){ fx, y + 0.012f, fz }, 0.009f, A(fl[k % 3]));
     }
 }
 
@@ -5346,7 +5732,7 @@ static void DrawBins3D(void) {
         BoxC(px, 0.096f, pz, 0.066f, 0.014f, 0.066f, A((Color){ 45, 50, 56, 255 }));
         if (smartCity) {
             Color led = (b->fill >= 95.0f) ? (Color){ 255, 60, 50, 255 } : (b->fill >= 75.0f ? (Color){ 250, 165, 45, 255 } : (b->fill >= 50.0f ? (Color){ 250, 225, 70, 255 } : (Color){ 70, 235, 115, 255 }));
-            DrawSphere((Vector3){ px, 0.118f, pz }, 0.013f, led);
+            GSphere((Vector3){ px, 0.118f, pz }, 0.013f, led);
             SolarPanel(px, 0.108f, pz - 0.018f, 0.04f, 0.022f, 20.0f);
         }
         if (b->fill >= 100.0f) {                                           // overflowing: litter around the bin
@@ -5373,15 +5759,15 @@ static void DrawLeaks3D(void) {
         const Leak *l = &leaks[i];
         if (!l->active) continue;
         float cx = l->x + 0.5f, cz = l->y + 0.5f, pl = 0.5f + 0.5f * sinf(t * 6.0f + i);
-        DrawCylinder((Vector3){ cx, 0.072f, cz }, 0.20f + 0.05f * pl, 0.20f + 0.05f * pl, 0.004f, 18, (Color){ 70, 140, 235, 170 });
+        GCylinder((Vector3){ cx, 0.072f, cz }, 0.20f + 0.05f * pl, 0.20f + 0.05f * pl, 0.004f, 18, (Color){ 70, 140, 235, 170 });
         for (int k = 0; k < 5; k++) {
             float a = t * 3.0f + k * 1.26f, h = 0.04f + 0.17f * fabsf(sinf(t * 4.0f + k * 0.9f));
-            DrawSphere((Vector3){ cx + 0.08f * cosf(a), 0.07f + h, cz + 0.08f * sinf(a) }, 0.012f, (Color){ 190, 220, 255, 230 });
+            GSphere((Vector3){ cx + 0.08f * cosf(a), 0.07f + h, cz + 0.08f * sinf(a) }, 0.012f, (Color){ 190, 220, 255, 230 });
         }
         if (l->detected) {
-            DrawCylinder((Vector3){ cx, 0.074f, cz }, 0.27f, 0.27f, 0.003f, 22, smartCity ? (Color){ 70, 230, 200, 140 } : (Color){ 245, 190, 50, 140 });
+            GCylinder((Vector3){ cx, 0.074f, cz }, 0.27f, 0.27f, 0.003f, 22, smartCity ? (Color){ 70, 230, 200, 140 } : (Color){ 245, 190, 50, 140 });
             BoxC(cx, 0.30f, cz, 0.020f, 0.07f, 0.020f, (Color){ 245, 190, 50, 255 });
-            DrawSphere((Vector3){ cx, 0.22f, cz }, 0.014f, (Color){ 245, 190, 50, 255 });
+            GSphere((Vector3){ cx, 0.22f, cz }, 0.014f, (Color){ 245, 190, 50, 255 });
         }
     }
 }
@@ -5394,7 +5780,7 @@ static void DrawDeliveryMarks3D(void) {
         float a = Clamp(m->t / 7.0f, 0.0f, 1.0f);
         BoxC(m->x, 0.035f, m->y, 0.05f, 0.04f, 0.05f, A(m->kind == D_PARCEL ? (Color){ 200, 150, 80, 255 } : (Color){ 245, 245, 248, 255 }));
         if (m->kind == D_MEDSUP) { BoxC(m->x, 0.058f, m->y, 0.03f, 0.004f, 0.010f, (Color){ 215, 35, 40, 255 }); BoxC(m->x, 0.058f, m->y, 0.010f, 0.004f, 0.03f, (Color){ 215, 35, 40, 255 }); }
-        DrawCylinder((Vector3){ m->x, 0.02f, m->y }, 0.10f + (1.0f - a) * 0.12f, 0.10f + (1.0f - a) * 0.12f, 0.002f, 16, Fade((Color){ 120, 230, 160, 255 }, a * 0.5f));
+        GCylinder((Vector3){ m->x, 0.02f, m->y }, 0.10f + (1.0f - a) * 0.12f, 0.10f + (1.0f - a) * 0.12f, 0.002f, 16, Fade((Color){ 120, 230, 160, 255 }, a * 0.5f));
     }
 }
 
@@ -5406,9 +5792,9 @@ static void DrawPlusWorld3D(void) {
         float hx = HEATPLANT_X + 0.5f, hz = HEATPLANT_Y + 0.5f;
         BoxT(TX_CONCRETE, hx, 0.012f, hz, 0.96f, 0.024f, 0.96f, A(WHITE));
         BoxT(TX_CORRUG, hx - 0.10f, 0.13f, hz + 0.05f, 0.46f, 0.20f, 0.46f, A((Color){ 205, 210, 215, 255 }));
-        DrawCylinder((Vector3){ hx + 0.30f, 0.024f, hz - 0.18f }, 0.11f, 0.11f, 0.30f, 14, A((Color){ 225, 120, 55, 255 }));
-        DrawCylinder((Vector3){ hx + 0.30f, 0.324f, hz - 0.18f }, 0.0f, 0.11f, 0.05f, 14, A((Color){ 190, 90, 40, 255 }));
-        DrawCylinder((Vector3){ hx + 0.30f, 0.024f, hz + 0.20f }, 0.07f, 0.07f, 0.22f, 12, A((Color){ 235, 190, 90, 255 }));
+        GCylinder((Vector3){ hx + 0.30f, 0.024f, hz - 0.18f }, 0.11f, 0.11f, 0.30f, 14, A((Color){ 225, 120, 55, 255 }));
+        GCylinder((Vector3){ hx + 0.30f, 0.324f, hz - 0.18f }, 0.0f, 0.11f, 0.05f, 14, A((Color){ 190, 90, 40, 255 }));
+        GCylinder((Vector3){ hx + 0.30f, 0.024f, hz + 0.20f }, 0.07f, 0.07f, 0.22f, 12, A((Color){ 235, 190, 90, 255 }));
         BoxC(hx - 0.10f, 0.26f, hz + 0.05f, 0.40f, 0.012f, 0.40f, A((Color){ 120, 128, 134, 255 }));
         BoxC(hx, 0.075f, 10.04f + (hz - 10.04f) * 0.5f, 0.032f, 0.030f, hz - 10.04f, A((Color){ 225, 110, 45, 255 }));
         for (int k = 0; k < N_DH; k++) {
@@ -5424,7 +5810,7 @@ static void DrawPlusWorld3D(void) {
             }
             for (int d = 0; d < (int)(len / 1.4f) + 1; d++) {
                 float u = fmodf(t * 0.9f + d * 1.4f, len) / len, px = x0 + (x1 - x0) * u, py = y0 + (y1 - y0) * u;
-                if (!IsRoad((int)px, (int)py)) DrawSphere((Vector3){ px, 0.098f, py }, 0.015f, (Color){ 255, 225, 120, 255 });
+                if (!IsRoad((int)px, (int)py)) GSphere((Vector3){ px, 0.098f, py }, 0.015f, (Color){ 255, 225, 120, 255 });
             }
         }
     }
@@ -5458,7 +5844,7 @@ static void DrawPlusWorld3D(void) {
             }
             if (((x + y) & 1) == 1) {
                 BoxC(x + 0.5f, 0.10f, y + 0.5f, 0.032f, 0.07f, 0.026f, A((Color){ 45, 50, 58, 255 }));
-                DrawSphere((Vector3){ x + 0.5f, 0.155f, y + 0.5f }, 0.016f, chargeCol);
+                GSphere((Vector3){ x + 0.5f, 0.155f, y + 0.5f }, 0.016f, chargeCol);
                 BoxC(x + 0.5f, 0.124f, y + 0.5f + 0.014f, 0.020f, 0.012f, 0.002f, (Color){ 30, 210, 120, 255 });
             }
         }
@@ -5476,8 +5862,8 @@ static void DrawPlusWorld3D(void) {
         Color c = AqColor(aqLevel[i]);
         BoxC(px, 0.20f, pz, 0.012f, 0.40f, 0.012f, A((Color){ 85, 95, 108, 255 }));
         BoxC(px, 0.41f, pz, 0.05f, 0.03f, 0.05f, A((Color){ 30, 38, 52, 255 }));
-        DrawSphere((Vector3){ px, 0.46f, pz }, 0.030f, c);
-        DrawCylinder((Vector3){ px, 0.47f, pz }, 0.06f, 0.06f, 0.002f, 16, Fade(c, 0.35f + 0.2f * sinf(t * 3.0f + i)));
+        GSphere((Vector3){ px, 0.46f, pz }, 0.030f, c);
+        GCylinder((Vector3){ px, 0.47f, pz }, 0.06f, 0.06f, 0.002f, 16, Fade(c, 0.35f + 0.2f * sinf(t * 3.0f + i)));
     }
     // ---- flood sensors + storm-drain gates ----
     for (int i = 0; i < N_FLOOD; i++) {
@@ -5485,7 +5871,7 @@ static void DrawPlusWorld3D(void) {
         int d = SidePos(FLOOD_POS[i][0], FLOOD_POS[i][1], 0.44f, &px, &pz);
         Color c = floodState[i] == 2 ? (Color){ 235, 55, 50, 255 } : (floodState[i] == 1 ? (Color){ 245, 190, 50, 255 } : (Color){ 70, 160, 255, 255 });
         BoxC(px, 0.09f, pz, 0.010f, 0.18f, 0.010f, A((Color){ 80, 90, 110, 255 }));
-        DrawSphere((Vector3){ px, 0.20f, pz }, 0.020f, c);
+        GSphere((Vector3){ px, 0.20f, pz }, 0.020f, c);
         if (d >= 0) {
             float gx = FLOOD_POS[i][0] + 0.5f + DX[d] * 0.40f, gz = FLOOD_POS[i][1] + 0.5f + DY[d] * 0.40f;
             BoxC(gx, 0.066f, gz, DX[d] ? 0.02f : 0.26f, 0.006f, DY[d] ? 0.02f : 0.26f, A((Color){ 40, 44, 50, 255 }));
@@ -5499,9 +5885,9 @@ static void DrawPlusFarm3D(void) {
     float f = Clamp(rainTankKL / RAIN_TANK_CAP, 0.0f, 1.0f);
     for (int i = 0; i < 2; i++) {
         float tx = 24.8f + i * 1.15f, tz = 8.5f;
-        DrawCylinder((Vector3){ tx, 0.03f, tz }, 0.31f, 0.31f, 0.36f, 20, A((Color){ 205, 212, 218, 255 }));
-        DrawCylinder((Vector3){ tx, 0.39f, tz }, 0.0f, 0.31f, 0.06f, 20, A((Color){ 150, 158, 166, 255 }));
-        DrawCylinder((Vector3){ tx, 0.04f, tz }, 0.318f, 0.318f, 0.30f * f + 0.002f, 20, A((Color){ 70, 150, 245, 255 }));
+        GCylinder((Vector3){ tx, 0.03f, tz }, 0.31f, 0.31f, 0.36f, 20, A((Color){ 205, 212, 218, 255 }));
+        GCylinder((Vector3){ tx, 0.39f, tz }, 0.0f, 0.31f, 0.06f, 20, A((Color){ 150, 158, 166, 255 }));
+        GCylinder((Vector3){ tx, 0.04f, tz }, 0.318f, 0.318f, 0.30f * f + 0.002f, 20, A((Color){ 70, 150, 245, 255 }));
         BoxC(tx + 0.36f, 0.20f, tz, 0.018f, 0.34f, 0.018f, A((Color){ 40, 44, 50, 255 }));
         BoxC(tx + 0.36f, 0.04f + 0.15f * f, tz, 0.026f, 0.30f * f + 0.004f, 0.026f, A((Color){ 90, 180, 255, 255 }));
     }
@@ -5523,14 +5909,14 @@ static void DrawUCarDoor(const UCar *u, int door, bool inside) {
         BoxC(sgn * (W * 0.5f + 0.0012f), 0.050f, hz - dl * 0.5f, 0.002f, 0.044f, dl, A((Color){ 34, 34, 40, 255 }));
         BoxC(sgn * (W * 0.43f + 0.0006f), 0.090f, hz - dl * 0.5f, 0.0015f, 0.036f, dl * 0.94f, A((Color){ 52, 52, 60, 255 }));
     }
-    rlPushMatrix();
-    rlTranslatef(sgn * W * 0.5f, 0.0f, hz);
-    rlRotatef((door == 0) ? ang : -ang, 0, 1, 0);
+    GXPush();
+    GXTrans(sgn * W * 0.5f, 0.0f, hz);
+    GXRot((door == 0) ? ang : -ang, 0, 1, 0);
     BoxC(sgn * 0.004f, 0.046f, -dl * 0.5f, 0.008f, 0.038f, dl, body);                                // lower door panel
     if (!inside) BoxC(sgn * (-W * 0.07f + 0.004f), 0.088f, -dl * 0.5f, 0.008f, 0.038f, dl * 0.94f, glass);   // window (the driver looks through it)
     BoxC(sgn * 0.0085f, 0.046f, -dl, 0.003f, 0.040f, 0.003f, seam);                                  // shut line
     BoxC(sgn * 0.0095f, 0.056f, -dl * 0.82f, 0.003f, 0.005f, 0.018f, A((Color){ 200, 200, 205, 255 }));   // handle
-    rlPopMatrix();
+    GXPop();
 }
 
 static void DrawUCarSeats(const UCar *u, bool skipDriver) {
@@ -5560,17 +5946,17 @@ static void DrawUCarCockpit(const UCar *u) {
     BoxC(0, 0.060f, zf - 0.020f, W * 0.90f, 0.016f, 0.034f, dark);                            // dashboard
     // steering wheel (turns with the steering angle)
     float wz = zf - 0.036f;
-    rlPushMatrix();
-    rlTranslatef(-W * 0.22f, 0.066f, wz);
-    rlRotatef(24.0f, 1, 0, 0);
-    rlRotatef(-u->steer * 130.0f, 0, 0, 1);
+    GXPush();
+    GXTrans(-W * 0.22f, 0.066f, wz);
+    GXRot(24.0f, 1, 0, 0);
+    GXRot(-u->steer * 130.0f, 0, 0, 1);
     for (int k = 0; k < 14; k++) {
         float a = k * (2.0f * PI / 14.0f);
         BoxC(cosf(a) * 0.0125f, sinf(a) * 0.0125f, 0, 0.0055f, 0.0055f, 0.0055f, dark);
     }
     BoxC(0, 0, 0, 0.025f, 0.0035f, 0.0035f, dark);
     BoxC(0, -0.006f, 0, 0.0035f, 0.012f, 0.0035f, dark);
-    rlPopMatrix();
+    GXPop();
 }
 
 static void DrawUCar3D(const UCar *u, bool inside) {
@@ -5712,11 +6098,11 @@ static void DrawNetwork3D(float off, float yh, Color col) {
             if (!pipeNode[y][x]) continue;
             float ax = x + 0.5f + off, az = y + 0.5f + off;
             float s = (surface[y][x] == T_ROAD) ? 0.09f : 0.17f;
-            DrawCube((Vector3){ ax, yh, az }, s, s, s, col);
+            GCube((Vector3){ ax, yh, az }, s, s, s, col);
             if (InBounds(x + 1, y) && pipeNode[y][x + 1] && (IsRoad(x, y) || IsRoad(x + 1, y)))
-                DrawCube((Vector3){ ax + 0.5f, yh, az }, 1.0f, 0.06f, 0.06f, col);
+                GCube((Vector3){ ax + 0.5f, yh, az }, 1.0f, 0.06f, 0.06f, col);
             if (InBounds(x, y + 1) && pipeNode[y + 1][x] && (IsRoad(x, y) || IsRoad(x, y + 1)))
-                DrawCube((Vector3){ ax, yh, az + 0.5f }, 0.06f, 0.06f, 1.0f, col);
+                GCube((Vector3){ ax, yh, az + 0.5f }, 0.06f, 0.06f, 1.0f, col);
         }
 }
 
@@ -5734,30 +6120,37 @@ static void DrawWeatherFx(void) {
 // ---------------------------------------------------------------------------
 // 3D drawing - people, emergency vehicles, particles, landfill life
 // ---------------------------------------------------------------------------
+// pedestrian, modelled in metres (1 m = 1/17 tile; see the cyclist model for M_SC)
 static void DrawPed3D(const Ped *p) {
     float yaw = 0.0f;
     bool walking = (p->wi < p->wn) && !(p->crossing && p->wi == 1 && !p->started) && !p->robbing && !p->ill;
     if (p->wi < p->wn) yaw = atan2f(p->wx[p->wi] - p->x, p->wy[p->wi] - p->y) * RAD2DEG;
-    float sw = walking ? sinf(p->phase) * 30.0f : 0.0f;
-    Color shirt = A(p->shirt), pants = A(p->pants), skin = A((Color){ 235, 190, 160, 255 });
+    float sw = walking ? sinf(p->phase) * 28.0f : 0.0f;
+    Color shirt = A(p->shirt), pants = A(p->pants), skin = A((Color){ 235, 190, 160, 255 }), shoe = A((Color){ 30, 28, 30, 255 });
     static const Color hair[4] = { {40,30,25,255}, {95,65,40,255}, {200,170,90,255}, {150,150,155,255} };
+    Color hc = A(hair[p->look & 3]);
     PushFrame(p->x, ENT_Y, p->y, yaw);
-    if (p->ill) { rlTranslatef(0.0f, 0.020f, 0.0f); rlRotatef(-86.0f, 1, 0, 0); }       // collapsed on the pavement
-    for (int s = -1; s <= 1; s += 2) {
-        rlPushMatrix(); rlTranslatef(s * 0.011f, 0.052f, 0); rlRotatef(s * sw, 1, 0, 0);
-        BoxC(0, -0.026f, 0, 0.016f, 0.052f, 0.018f, pants);
-        BoxC(0, -0.050f, 0.004f, 0.017f, 0.008f, 0.026f, A((Color){ 30, 28, 30, 255 }));
-        rlPopMatrix();
-        rlPushMatrix(); rlTranslatef(s * 0.027f, 0.104f, 0); rlRotatef(-s * sw, 1, 0, 0);
-        BoxC(0, -0.024f, 0, 0.011f, 0.048f, 0.013f, shirt);
-        rlPopMatrix();
+    if (p->ill) { GXTrans(0.0f, 0.020f, 0.0f); GXRot(-86.0f, 1, 0, 0); }          // collapsed on the pavement
+    for (int s = -1; s <= 1; s += 2) {                                             // legs swing from the hip
+        GXPush(); GXTrans(s * 0.09f * M_SC, 0.90f * M_SC, 0.0f); GXRot(s * sw, 1, 0, 0);
+        MBox(0, -0.42f, 0, 0.13f, 0.84f, 0.14f, pants);
+        MBox(0, -0.86f, 0.03f, 0.12f, 0.08f, 0.24f, shoe);
+        GXPop();
     }
-    BoxC(0, 0.080f, 0, 0.040f, 0.058f, 0.024f, shirt);
-    DrawSphere((Vector3){ 0, 0.126f, 0 }, 0.017f, skin);
-    BoxC(0, 0.139f, -0.002f, 0.030f, 0.010f, 0.030f, A(hair[p->look & 3]));
-    if ((p->look >> 2) & 1) BoxC(0, 0.145f, 0.004f, 0.034f, 0.008f, 0.040f, A(shirt));           // cap
-    if (p->criminal) BoxC(0, 0.126f, 0.015f, 0.032f, 0.008f, 0.005f, A((Color){ 20, 20, 20, 255 }));   // mask
-    if (p->robbing) BoxC(0, 0.20f + 0.02f * sinf((float)GetTime() * 10.0f), 0, 0.02f, 0.05f, 0.02f, RED);
+    for (int s = -1; s <= 1; s += 2) {                                             // arms swing from the shoulder
+        GXPush(); GXTrans(s * 0.23f * M_SC, 1.42f * M_SC, 0.0f); GXRot(-s * sw, 1, 0, 0);
+        MBox(0, -0.27f, 0, 0.09f, 0.54f, 0.10f, shirt);
+        MBox(0, -0.60f, 0, 0.08f, 0.12f, 0.09f, skin);
+        GXPop();
+    }
+    MBox(0, 0.92f, 0, 0.30f, 0.12f, 0.20f, pants);                                 // hips
+    MBox(0, 1.18f, 0, 0.34f, 0.54f, 0.22f, shirt);                                 // torso
+    MBox(0, 1.50f, 0, 0.10f, 0.08f, 0.10f, skin);                                  // neck
+    GSphere(MV(0, 1.60f, 0), 0.11f * M_SC, skin);                                  // head
+    GSphere(MV(0, 1.63f, -0.02f), 0.118f * M_SC, hc);                              // hair (top and back)
+    if ((p->look >> 2) & 1) { MBox(0, 1.71f, -0.005f, 0.23f, 0.04f, 0.24f, shirt); MBox(0, 1.70f, 0.13f, 0.20f, 0.02f, 0.08f, shirt); }   // cap + peak
+    if (p->criminal) MBox(0, 1.60f, 0.105f, 0.13f, 0.06f, 0.02f, A((Color){ 20, 20, 20, 255 }));   // mask
+    if (p->robbing) MBox(0, 1.98f + 0.03f * sinf((float)GetTime() * 10.0f), 0, 0.10f, 0.22f, 0.10f, RED);
     PopFrame();
     if (p->ill) {                                                                      // medical-emergency marker
         float by = 0.20f + 0.015f * sinf((float)GetTime() * 6.0f);
@@ -5766,7 +6159,6 @@ static void DrawPed3D(const Ped *p) {
         BoxC(p->x, by, p->y, 0.010f, 0.034f, 0.014f, A((Color){ 215, 35, 40, 255 }));
     }
 }
-
 static void DrawPoliceCar3D(const Responder *r, double t) {
     PushFrame(r->x, ENT_Y, r->y, 90.0f - r->angle);
     Color w = A(WHITE);
@@ -5802,8 +6194,8 @@ static void DrawFireTruck3D(const Responder *r, double t) {
     PopFrame();
     if (r->spraying) {                                                    // water jet
         Vector3 a = { r->x, 0.15f, r->y }, b = { r->sx, 0.12f + 0.08f * sinf((float)t * 12.0f), r->sy };
-        DrawCylinderEx(a, b, 0.012f, 0.03f, 6, (Color){ 140, 200, 255, 170 });
-        DrawSphere(b, 0.07f, (Color){ 200, 230, 255, 120 });
+        GCylinderEx(a, b, 0.012f, 0.03f, 6, (Color){ 140, 200, 255, 170 });
+        GSphere(b, 0.07f, (Color){ 200, 230, 255, 120 });
     }
 }
 
@@ -5811,8 +6203,9 @@ static void DrawLandfillLife3D(void) {
     float t = (float)GetTime();
     for (int k = 0; k < 2; k++) {               // bulldozers shoving rubbish
         float a = t * (0.22f + 0.05f * k) + k * 3.0f;
-        float px = 21.5f + cosf(a) * (1.4f - 0.3f * k), pz = 11.5f + sinf(a * 1.3f) * 0.6f;
-        float dx = -sinf(a) * (1.4f - 0.3f * k), dz = cosf(a * 1.3f) * 1.3f * 0.6f;
+        float R = 0.22f - 0.07f * k;            // tight loops: the machines stay on the tip, inside the fence
+        float px = 21.5f + cosf(a) * R, pz = 11.5f + sinf(a * 1.3f) * R * 0.5f;
+        float dx = -sinf(a) * R, dz = cosf(a * 1.3f) * 1.3f * R * 0.5f;
         PushFrame(px, 0.05f, pz, atan2f(dx, dz) * RAD2DEG);
         BoxC(0, 0.05f, 0, 0.12f, 0.05f, 0.20f, A((Color){ 235, 190, 30, 255 }));
         BoxC(0, 0.10f, -0.03f, 0.09f, 0.05f, 0.08f, A(GLASS));
@@ -5828,9 +6221,9 @@ static void DrawLandfillLife3D(void) {
         PushFrame(px, py, pz, atan2f(-sinf(a), cosf(a) * 0.6f) * RAD2DEG);
         BoxC(0, 0, 0, 0.025f, 0.015f, 0.05f, (Color){ 245, 245, 245, 255 });
         for (int s = -1; s <= 1; s += 2) {
-            rlPushMatrix(); rlTranslatef(s * 0.012f, 0, 0); rlRotatef(s * flap, 0, 0, 1);
+            GXPush(); GXTrans(s * 0.012f, 0, 0); GXRot(s * flap, 0, 0, 1);
             BoxC(s * 0.03f, 0, 0, 0.06f, 0.004f, 0.025f, (Color){ 235, 235, 240, 255 });
-            rlPopMatrix();
+            GXPop();
         }
         PopFrame();
     }
@@ -5858,20 +6251,25 @@ static void DrawParticles3D(void) {
 // ---------------------------------------------------------------------------
 // 3D scene
 // ---------------------------------------------------------------------------
+// street-lamp posts (static); the glow is drawn by DrawStreetLampGlow (live)
 static void DrawStreetLamp(int x, int y) {
     int d = RoadSide(x, y);
     if (!IsRoad(x + DX[d], y + DY[d])) return;
     float px = x + 0.5f + DX[d] * 0.40f, pz = y + 0.5f + DY[d] * 0.40f;
     BoxC(px, 0.14f, pz, 0.010f, 0.28f, 0.010f, A((Color){ 70, 72, 78, 255 }));
     BoxC(px - DX[d] * 0.03f, 0.285f, pz - DY[d] * 0.03f, DX[d] ? 0.07f : 0.012f, 0.012f, DY[d] ? 0.07f : 0.012f, A((Color){ 70, 72, 78, 255 }));
-    if (NightNow()) {                                                    // smart lamps dim to ~30% until somebody comes past
-        float lv = lampLvl[y][x];
-        Vector3 lp = { px - DX[d] * 0.06f, 0.275f, pz - DY[d] * 0.06f };
-        DrawSphere(lp, 0.009f + 0.009f * lv, (Color){ (unsigned char)(120 + 135 * lv), (unsigned char)(110 + 130 * lv), (unsigned char)(70 + 100 * lv), 255 });
-        if (lv > 0.6f) DrawCylinderEx(lp, (Vector3){ lp.x, 0.07f, lp.z }, 0.005f, 0.10f, 8, (Color){ 255, 238, 170, 22 });
-    }
 }
 
+// the lamp glow and its light cone (live; smart lamps dim to ~30% until somebody comes past)
+static void DrawStreetLampGlow(int x, int y) {
+    int d = RoadSide(x, y);
+    if (!IsRoad(x + DX[d], y + DY[d]) || !NightNow()) return;
+    float px = x + 0.5f + DX[d] * 0.40f, pz = y + 0.5f + DY[d] * 0.40f;
+    float lv = lampLvl[y][x];
+    Vector3 lp = { px - DX[d] * 0.06f, 0.275f, pz - DY[d] * 0.06f };
+    GSphere(lp, 0.009f + 0.009f * lv, (Color){ (unsigned char)(120 + 135 * lv), (unsigned char)(110 + 130 * lv), (unsigned char)(70 + 100 * lv), 255 });
+    if (lv > 0.6f) GCylinderEx(lp, (Vector3){ lp.x, 0.07f, lp.z }, 0.005f, 0.10f, 8, (Color){ 255, 238, 170, 22 });
+}
 static void DrawCongestion3D(void) {
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) {
@@ -5896,7 +6294,6 @@ static void DrawGround3D(int x, int y, bool xray) {
     if (s == T_ROAD) {
         if (!layerOn[L_ROADS]) return;
         Color rt = xray ? (Color){ 150, 150, 150, 255 } : WHITE;
-        if (floodLevel > 0.02f) rt = BlendOver(rt, (Color){ 80, 140, 255, (unsigned char)(floodLevel * 130.0f) });
         BoxT(TX_ASPHALT, cx, 0.03f, cz, 1.0f, 0.06f, 1.0f, rt);
         int ln = RoadLine(x, y);
         Color lc = xray ? (Color){ 150, 150, 150, 255 } : COL_LINE;
@@ -5919,25 +6316,30 @@ static void DrawGround3D(int x, int y, bool xray) {
     }
 }
 
-static void DrawScene3D(void) {
-    bool xray = layerOn[L_WATER] || layerOn[L_SEWER];
-    float t = (float)GetTime();
-    rlDisableBackfaceCulling();
-
-    DrawPlane((Vector3){ MAP_W / 2.0f, -0.03f, MAP_H / 2.0f }, (Vector2){ MAP_W + 60, MAP_H + 60 }, (Color){ 58, 105, 52, 255 });
-
+// ---- the scene -------------------------------------------------------------------------
+// The city is split in two. Everything that does not move is baked into GPU meshes (rebuilt only
+// when the layers, the night, the city or a tile's state changes). Everything that moves or
+// changes every frame is batched fresh each frame.
+static unsigned int GSceneKey(bool xray) {
+    unsigned int h = 2166136261u;
+#define HMIX(v) (h = (h ^ (unsigned int)(v)) * 16777619u)
+    HMIX(gSceneGen); HMIX(smartCity); HMIX(NightNow()); HMIX(xray);
+    for (int i = 0; i < L_COUNT; i++) HMIX(layerOn[i]);
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) {
-            DrawGround3D(x, y, xray);
-            float cx = x + 0.5f, cz = y + 0.5f;
-            if (layerOn[L_HEAT])      BoxC(cx, 0.080f, cz, 1.0f, 0.01f, 1.0f, HeatColorAt(x, y));
-            if (layerOn[L_POLLUTION]) BoxC(cx, 0.095f, cz, 1.0f, 0.01f, 1.0f, PolColorAt(x, y));
+            HMIX(surface[y][x]); HMIX(bType[y][x]); HMIX(zone[y][x]); HMIX(ctrl[y][x]);
+            HMIX(gateTile[y][x]); HMIX(pedNode[y][x]); HMIX(paved[y][x]); HMIX(health[y][x] < 50.0f);
         }
-    if (layerOn[L_CONGESTION] && layerOn[L_ROADS]) DrawCongestion3D();
+#undef HMIX
+    return h;
+}
 
-    // Underground networks (same offsets as 2D so both views match)
-    if (layerOn[L_SEWER]) DrawNetwork3D(0.11f, 0.10f, SewerColor());
-    if (layerOn[L_WATER]) DrawNetwork3D(-0.11f, 0.13f, COL_WATER_PIPE);
+static void DrawStaticScene(bool xray) {
+    gAlpha = 1.0f;
+    GPlane(V3(MAP_W / 2.0f, -0.03f, MAP_H / 2.0f), (Vector2){ MAP_W + 60, MAP_H + 60 }, (Color){ 58, 105, 52, 255 });
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) DrawGround3D(x, y, xray);
+    if (layerOn[L_WATER]) DrawNetwork3D(-0.11f, 0.13f, COL_WATER_PIPE);     // (the sewer main is live: it can flash red)
 
     gAlpha = xray ? 0.45f : 1.0f;
     for (int y = 0; y < MAP_H; y++)
@@ -5950,29 +6352,64 @@ static void DrawScene3D(void) {
                 if (!xray) DrawGrassTufts(x, y);
                 if (deco[y][x] && !paved[y][x]) DrawDeco3D(x, y);
             } else if (s == T_ROAD) {
-                if (layerOn[L_ROADS]) { DrawJunction3D(x, y, xray); if (smartCity && monitorTile[y][x]) DrawMonitor3D(x, y); }
+                if (layerOn[L_ROADS]) DrawJunction3D(x, y, xray);
             } else if (layerOn[L_BUILDINGS]) {
-                DrawStructure3D(x, y);
-                if (s == T_BUILDING && bType[y][x] == B_IND && zone[y][x] == Z_INDUSTRIAL) {}
+                DrawStructureStatic3D(x, y);
             }
             if (layerOn[L_BUILDINGS] && zone[y][x] == Z_INDUSTRIAL && surface[y][x] == T_GRASS && paved[y][x] &&
                 !(smartCity && ((x == HUB_X && y == HUB_Y) || (x == HEATPLANT_X && y == HEATPLANT_Y)))) DrawYard3D(x, y);
             if (layerOn[L_ROADS] && pedNode[y][x] && ((x * 3 + y * 5) % 4 == 0) && surface[y][x] != T_ROAD) DrawStreetLamp(x, y);
-
-            // heat / pollution tint on top of tall buildings
-            if (layerOn[L_BUILDINGS] && IsBldg(s) && (layerOn[L_HEAT] || layerOn[L_POLLUTION])) {
-                float h = bHeight[y][x];
-                if (layerOn[L_HEAT])      BoxC(x + 0.5f, h / 2, y + 0.5f, 0.78f, h + 0.02f, 0.78f, HeatColorAt(x, y));
-                if (layerOn[L_POLLUTION]) BoxC(x + 0.5f, h / 2, y + 0.5f, 0.79f, h + 0.03f, 0.79f, PolColorAt(x, y));
-            }
-            if (fireI[y][x] > 0.0f) BoxC(x + 0.5f, 0.07f, y + 0.5f, 0.85f, 0.01f, 0.85f, Fade(COL_FIRE, 0.15f + 0.3f * fireI[y][x] / 100.0f));
         }
     gAlpha = 1.0f;
-    if (layerOn[L_BUILDINGS]) { DrawFences3D(); DrawLandfillLife3D(); if (smartCity) { DrawFarm3D(); DrawPlusFarm3D(); } }
+    if (layerOn[L_BUILDINGS]) {
+        DrawFences3D();
+        if (smartCity) DrawFarmStatic3D();
+    }
+}
+
+// a flood sheet over a road tile
+static void DrawFloodTile(int x, int y) {
+    BoxC(x + 0.5f, 0.0625f, y + 0.5f, 1.0f, 0.002f, 1.0f, (Color){ 80, 140, 255, (unsigned char)(floodLevel * 130.0f) });
+}
+
+static void DrawLiveScene(bool xray) {
+    float t = (float)GetTime();
+    gAlpha = 1.0f;
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) {
+            int s = surface[y][x];
+            float cx = x + 0.5f, cz = y + 0.5f;
+            if (s == T_ROAD && layerOn[L_ROADS]) {
+                if (floodLevel > 0.02f) DrawFloodTile(x, y);
+                DrawJunctionLive3D(x, y);
+                if (smartCity && monitorTile[y][x]) DrawMonitor3D(x, y);
+            }
+            if (layerOn[L_HEAT])      BoxC(cx, 0.080f, cz, 1.0f, 0.01f, 1.0f, HeatColorAt(x, y));
+            if (layerOn[L_POLLUTION]) BoxC(cx, 0.095f, cz, 1.0f, 0.01f, 1.0f, PolColorAt(x, y));
+            if (fireI[y][x] > 0.0f)   BoxC(cx, 0.07f, cz, 0.85f, 0.01f, 0.85f, Fade(COL_FIRE, 0.15f + 0.3f * fireI[y][x] / 100.0f));
+            if (layerOn[L_ROADS] && pedNode[y][x] && ((x * 3 + y * 5) % 4 == 0) && s != T_ROAD) DrawStreetLampGlow(x, y);
+            if (layerOn[L_BUILDINGS]) {
+                gAlpha = xray ? 0.45f : 1.0f;
+                DrawStructureLive3D(x, y);
+                gAlpha = 1.0f;
+                if (IsBldg(s) && (layerOn[L_HEAT] || layerOn[L_POLLUTION])) {        // heat / pollution tint on tall buildings
+                    float h = bHeight[y][x];
+                    if (layerOn[L_HEAT])      BoxC(cx, h / 2, cz, 0.78f, h + 0.02f, 0.78f, HeatColorAt(x, y));
+                    if (layerOn[L_POLLUTION]) BoxC(cx, h / 2, cz, 0.79f, h + 0.03f, 0.79f, PolColorAt(x, y));
+                }
+            }
+        }
+    if (layerOn[L_CONGESTION] && layerOn[L_ROADS]) DrawCongestion3D();
+    if (layerOn[L_SEWER]) DrawNetwork3D(0.11f, 0.10f, SewerColor());
+    if (layerOn[L_BUILDINGS]) {
+        DrawFencesLive3D();
+        DrawLandfillLife3D();
+        if (smartCity) { DrawFarmLive3D(); DrawPlusFarm3D(); }
+    }
     if (layerOn[L_ROADS]) { DrawBins3D(); DrawLeaks3D(); }
     if (layerOn[L_BUILDINGS] && smartCity) DrawPlusWorld3D();
 
-    // Vehicles and people
+    // vehicles and people
     if (layerOn[L_TRAFFIC])
         for (int i = 0; i < MAX_CARS; i++) if (cars[i].active) DrawCar3D(&cars[i]);
     DrawUserCars3D();
@@ -5982,13 +6419,35 @@ static void DrawScene3D(void) {
     if (binTruck.active) DrawBinTruck3D(&binTruck, t);
     DrawDeliveryMarks3D();
     for (int i = 0; i < MAX_PEDS; i++) if (peds[i].active) DrawPed3D(&peds[i]);
-
     DrawParticles3D();
     for (int i = 0; i < MAX_DRONES; i++) if (drones[i].active) DrawDrone3D(&drones[i], t);
+    (void)xray;
+}
+
+static void DrawScene3D(void) {
+    bool xray = layerOn[L_WATER] || layerOn[L_SEWER];
+    static unsigned int key = 0;
+    static bool baked = false;
+    unsigned int k = GSceneKey(xray);
+    rlDisableBackfaceCulling();
+    if (!baked || k != key) {                       // the static scenery changed: bake it again
+        GBakeStart();
+        DrawStaticScene(xray);
+        GBakeFinish();
+        key = k;
+        baked = true;
+    }
+    GDrawBaked(false);                               // static scenery, opaque
+    GXReset();
+    DrawLiveScene(xray);
+    GFlushLive(false);                               // moving and time-varying things, opaque
+    rlDisableDepthMask();
+    GDrawBaked(true);                                // see-through scenery (no depth writes)
+    GFlushLive(true);
+    rlEnableDepthMask();
     if (hoverOK && viewMode != VIEW_FP) DrawCubeWires((Vector3){ hoverX + 0.5f, 0.05f, hoverY + 0.5f }, 1.0f, 0.1f, 1.0f, WHITE);
     rlEnableBackfaceCulling();
 }
-
 // ---------------------------------------------------------------------------
 // Smart-city dashboard + digital twin (key D)
 // ---------------------------------------------------------------------------
