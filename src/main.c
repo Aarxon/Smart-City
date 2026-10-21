@@ -40,7 +40,15 @@
 #define SCREEN_W    (VIEW_W + PANEL_W * 2)
 #define SCREEN_H    (VIEW_H + 64)       // map view + a status strip underneath
 
-#define SIDEWALK_W  5          // pixels (2D); scaled to tile units in 3D
+#define SIDEWALK_W  10         // pixels (2D); scaled to tile units in 3D (the strip beside each road)
+#define LANE_CAR    0.10f      // cars drive this far either side of the road centre (left-hand traffic)
+#define LANE_BIKE   0.17f      // cyclists ride just inside the parked cars, nearer the kerb
+#define BLD_W       0.94f     // generic building footprint (tile units; was 0.85)
+#define BLD_PODIUM  0.92f     // skyrise podium
+#define BLD_TOWER   0.74f     // skyrise tower
+#define ROAD_INSET  0.08f     // the road surface stops this far short of a sidewalk; the sidewalk strip takes that space
+#define SIDE_IN     (SIDEWALK_W / (float)TILE - ROAD_INSET)   // buildings, houses and fences stay this far in from a road-side tile edge
+#define BLD_MARGIN  0.03f     // ...and this far in from the other tile edges
 #define LINE_THICK  3
 #define HIST        120        // graph samples (1 per second => 2 minutes)
 #define DAY_LEN     120.0f     // real seconds per simulated day
@@ -292,6 +300,7 @@ static const float VWID[V_COUNT] = { 0.115f, 0.11f, 0.115f, 0.12f, 0.125f, 0.125
 static float Rf(void) { return GetRandomValue(0, 10000) / 10000.0f; }
 static bool InBounds(int x, int y) { return x >= 0 && x < MAP_W && y >= 0 && y < MAP_H; }
 static bool IsRoad(int x, int y) { return InBounds(x, y) && surface[y][x] == T_ROAD; }
+static bool ZoneFenced(int z) { return z >= Z_GATED1 && z <= Z_LANDFILL; }
 static bool IsBldg(int s) { return s == T_BUILDING || s == T_HOUSE || s == T_MALL || s == T_HOSPITAL; }
 static bool Flammable(int x, int y) {
     int s = surface[y][x];
@@ -346,17 +355,18 @@ static int RoadNeighbours(int x, int y) {
 
 // Sidewalk pieces for a non-road tile, in tile units (0..1). Used by both 2D and 3D.
 static int SidewalkRects(int x, int y, Rectangle *r) {
-    float s = SIDEWALK_W / (float)TILE;
+    // The strip is SIDEWALK_W wide and reaches ROAD_INSET into the road, which is narrowed to match.
+    float w = SIDEWALK_W / (float)TILE, d = ROAD_INSET, in = SIDE_IN;
     int n = 0;
     bool up = IsRoad(x, y - 1), down = IsRoad(x, y + 1), left = IsRoad(x - 1, y), right = IsRoad(x + 1, y);
-    if (up)    r[n++] = (Rectangle){ 0, 0, 1, s };
-    if (down)  r[n++] = (Rectangle){ 0, 1 - s, 1, s };
-    if (left)  r[n++] = (Rectangle){ 0, 0, s, 1 };
-    if (right) r[n++] = (Rectangle){ 1 - s, 0, s, 1 };
-    if (!up && !left && IsRoad(x - 1, y - 1))    r[n++] = (Rectangle){ 0, 0, s, s };
-    if (!up && !right && IsRoad(x + 1, y - 1))   r[n++] = (Rectangle){ 1 - s, 0, s, s };
-    if (!down && !left && IsRoad(x - 1, y + 1))  r[n++] = (Rectangle){ 0, 1 - s, s, s };
-    if (!down && !right && IsRoad(x + 1, y + 1)) r[n++] = (Rectangle){ 1 - s, 1 - s, s, s };
+    if (up)    r[n++] = (Rectangle){ 0, -d, 1, w };
+    if (down)  r[n++] = (Rectangle){ 0, 1 - in, 1, w };
+    if (left)  r[n++] = (Rectangle){ -d, 0, w, 1 };
+    if (right) r[n++] = (Rectangle){ 1 - in, 0, w, 1 };
+    if (!up && !left && IsRoad(x - 1, y - 1))    r[n++] = (Rectangle){ -d, -d, w, w };
+    if (!up && !right && IsRoad(x + 1, y - 1))   r[n++] = (Rectangle){ 1 - in, -d, w, w };
+    if (!down && !left && IsRoad(x - 1, y + 1))  r[n++] = (Rectangle){ -d, 1 - in, w, w };
+    if (!down && !right && IsRoad(x + 1, y + 1)) r[n++] = (Rectangle){ 1 - in, 1 - in, w, w };
     return n;
 }
 
@@ -531,7 +541,9 @@ static float DistToSeg(float px, float py, float x0, float y0, float x1, float y
 #define MAX_UCARS    28            // parked / player-driven cars (separate from the AI traffic)
 #define FP_EYE       0.125f        // eye height above the pavement (a pedestrian is about 0.145 tall)
 #define FP_RADIUS    0.032f        // body radius for walking collisions
-#define ENT_Y        0.048f        // pavement top: people and vehicles stand on this
+#define GROUND_TOP   0.03f     // the one flat level: grass, roads and car parks all sit on it
+#define WALK_TOP     0.032f    // sidewalks, drives and paths sit just above it; people and vehicles stand on this
+#define ENT_Y        WALK_TOP
 
 typedef struct {
     bool  active;
@@ -824,6 +836,127 @@ static bool HouseGateEdge(int x, int y) {
     return !(InBounds(nx, ny) && zone[ny][nx] == z);
 }
 
+// ---- room beside the road ---------------------------------------------------------------------------
+// The sidewalk strip runs along every road edge. Buildings, houses, stations and fences keep clear of it:
+// each tile has a "room" box, and what is built on the tile is scaled and slid into that box. Collisions
+// use the same mapping, so what is drawn is what is solid.
+#define FENCE_ROAD 0.29f           // a compound fence on a road edge stands here, just inside the sidewalk
+#define FENCE_GAP  0.012f          // solid things keep this far inside a fence line
+#define HNAT_X0 (HS_CX - HS_W * 0.5f)      // natural extents of a house (local frame)
+#define HNAT_X1 (HS_GX + HS_GW * 0.5f)
+#define HNAT_Z0 (-0.435f)                  // back hedge
+#define HNAT_Z1 (HS_GZ + HS_GL * 0.5f)     // garage front
+#define HNAT_Z1C 0.44f                     // a compound house also counts its drive
+static int DirOfVec(int vx, int vz) { return (vz < 0) ? 0 : (vz > 0) ? 1 : (vx < 0) ? 2 : 3; }
+static int RoadSide(int x, int y) {          // direction of the nearest road (for entrances)
+    for (int d = 0; d < 4; d++) if (IsRoad(x + DX[d], y + DY[d])) return d;
+    return 1;
+}
+// does side d of this tile open onto a corner square of sidewalk (a diagonal road with both sides open)?
+static bool CornerSide(int x, int y, int d) {
+    for (int e = 0; e < 4; e++) {
+        if (DX[e] * DX[d] + DY[e] * DY[d] != 0) continue;          // e must be at right angles to d
+        if (IsRoad(x + DX[d] + DX[e], y + DY[d] + DY[e]) && !IsRoad(x + DX[d], y + DY[d]) && !IsRoad(x + DX[e], y + DY[e])) return true;
+    }
+    return false;
+}
+static bool SideWalked(int x, int y, int d) { return IsRoad(x + DX[d], y + DY[d]) || CornerSide(x, y, d); }
+// is side d the outside edge of a fenced compound?
+static bool FencedSide(int x, int y, int d) {
+    int z = zone[y][x];
+    if (!ZoneFenced(z)) return false;
+    int nx = x + DX[d], ny = y + DY[d];
+    return !(InBounds(nx, ny) && zone[ny][nx] == z);
+}
+// where a compound fence on side d stands (measured from the tile centre)
+static float FenceLine(int x, int y, int d) { return SideWalked(x, y, d) ? FENCE_ROAD : FENCE_LINE; }
+// how far along the fence on side d (each way from the tile centre) the fence runs: a corner stops where the
+// perpendicular fence stands, so the segments meet and never run through each other
+static float FenceEnd(int x, int y, int z, int d, int sgn) {
+    int tx = DY[d] * sgn, ty = -DX[d] * sgn;                       // tangent (local +x is (DY,-DX))
+    int nx = x + tx, ny = y + ty;
+    int perp = DirOfVec(tx, ty);
+    if (!InBounds(nx, ny) || zone[ny][nx] != z) return FenceLine(x, y, perp);   // corner or free end
+    int ox = nx + DX[d], oy = ny + DY[d];
+    bool sameLine = !(InBounds(ox, oy) && zone[oy][ox] == z);      // the neighbour's own edge on this side is fenced too
+    return sameLine ? 0.5f : FenceLine(x, y, perp);
+}
+// how far from the tile centre something on side d may reach
+static float SideLimit(int x, int y, int d) {
+    float lim = 0.5f - (SideWalked(x, y, d) ? SIDE_IN : BLD_MARGIN);
+    if (FencedSide(x, y, d)) { float f = FenceLine(x, y, d) - FENCE_GAP; if (f < lim) lim = f; }
+    return lim;
+}
+typedef struct { float x0, x1, z0, z1; } Room;      // x across the frame, z along it (+z = the frame direction)
+// frame < 0: world axes. Otherwise the local frame of direction `frame`: +z = that direction, +x = (DY,-DX).
+static Room RoomIn(int x, int y, int frame) {
+    Room r;
+    if (frame < 0) {
+        r.x0 = -SideLimit(x, y, 2); r.x1 = SideLimit(x, y, 3);
+        r.z0 = -SideLimit(x, y, 0); r.z1 = SideLimit(x, y, 1);
+        return r;
+    }
+    r.z1 = SideLimit(x, y, frame); r.z0 = -SideLimit(x, y, frame ^ 1);
+    int px = DY[frame], pz = -DX[frame];
+    r.x1 = SideLimit(x, y, DirOfVec(px, pz)); r.x0 = -SideLimit(x, y, DirOfVec(-px, -pz));
+    return r;
+}
+// a thing with natural extents n0..n1 (around its natural centre) scaled by k and slid to sit in a room
+typedef struct { float n0x, n1x, n0z, n1z, ncx, ncz, ccx, ccz, kx, kz; } Fit;
+static Fit FitTo(Room r, float n0x, float n1x, float n0z, float n1z, bool uniform) {
+    Fit f;
+    f.n0x = n0x; f.n1x = n1x; f.n0z = n0z; f.n1z = n1z;
+    f.ncx = 0.5f * (n0x + n1x); f.ncz = 0.5f * (n0z + n1z);
+    float kx = (r.x1 - r.x0) / (n1x - n0x), kz = (r.z1 - r.z0) / (n1z - n0z);
+    if (kx > 1.0f) kx = 1.0f;
+    if (kz > 1.0f) kz = 1.0f;
+    if (uniform) { float k = kx < kz ? kx : kz; kx = kz = k; }
+    f.kx = kx; f.kz = kz;
+    // slide it as little as possible so that every part stays inside the room
+    float lo = r.x0 - f.ncx - kx * (n0x - f.ncx), hi = r.x1 - f.ncx - kx * (n1x - f.ncx);
+    float t = 0.0f; if (t < lo) t = lo; if (t > hi) t = hi;
+    f.ccx = f.ncx + t;
+    lo = r.z0 - f.ncz - kz * (n0z - f.ncz); hi = r.z1 - f.ncz - kz * (n1z - f.ncz);
+    t = 0.0f; if (t < lo) t = lo; if (t > hi) t = hi;
+    f.ccz = f.ncz + t;
+    return f;
+}
+static Fit FitIn(int x, int y, int frame, float n0x, float n1x, float n0z, float n1z) {
+    return FitTo(RoomIn(x, y, frame), n0x, n1x, n0z, n1z, false);
+}
+static Fit HouseFit(int x, int y) {
+    bool comp = ZoneFenced(zone[y][x]);
+    return FitTo(RoomIn(x, y, faceDir[y][x]), HNAT_X0, HNAT_X1, HNAT_Z0, comp ? HNAT_Z1C : HNAT_Z1, comp);
+}
+// the gateway a compound house leaves in its fence, in the house's frame (centre and half width); its piers
+// stand 0.07 out from the gap, so the gap is kept well short of the fence's corners
+static void HouseGate(int x, int y, float *gc, float *gh) {
+    Fit f = HouseFit(x, y);
+    int z = zone[y][x], d = faceDir[y][x];
+    float c = f.ccx + f.kx * (HS_GATE_X - f.ncx), h = f.kx * HS_GATE_HW;
+    float left = -FenceEnd(x, y, z, d, -1) + 0.08f, right = FenceEnd(x, y, z, d, 1) - 0.08f;
+    if (h > 0.5f * (right - left)) h = 0.5f * (right - left);
+    if (c < left + h) c = left + h;
+    if (c > right - h) c = right - h;
+    *gc = c; *gh = h;
+}
+// is a point (offset from the tile centre, world axes) inside a fitted thing's natural extents?
+static bool FitHit(Fit f, int frame, float dx, float dz) {
+    float lx = dx, lz = dz;
+    if (frame >= 0) { lx = dx * DY[frame] - dz * DX[frame]; lz = dx * DX[frame] + dz * DY[frame]; }
+    float nx = f.ncx + (lx - f.ccx) / f.kx, nz = f.ncz + (lz - f.ccz) / f.kz;
+    return nx >= f.n0x && nx <= f.n1x && nz >= f.n0z && nz <= f.n1z;
+}
+// a mall block: neighbouring mall tiles run together; every other edge stops at the room line
+static void MallRect(int x, int y, float *x0, float *x1, float *z0, float *z1) {
+    bool w = x > 0 && surface[y][x - 1] == T_MALL, e = x + 1 < MAP_W && surface[y][x + 1] == T_MALL;
+    bool n = y > 0 && surface[y - 1][x] == T_MALL, s = y + 1 < MAP_H && surface[y + 1][x] == T_MALL;
+    *x0 = w ? (float)x       : x + 0.5f - SideLimit(x, y, 2);
+    *x1 = e ? (float)(x + 1) : x + 0.5f + SideLimit(x, y, 3);
+    *z0 = n ? (float)y       : y + 0.5f - SideLimit(x, y, 0);
+    *z1 = s ? (float)(y + 1) : y + 0.5f + SideLimit(x, y, 1);
+}
+
 typedef struct { float x, y, z, u, v; unsigned char r, g, b, a; } GVert;
 typedef struct { GVert *v; int n, cap; } GBuf;
 
@@ -843,6 +976,10 @@ static void GXPop(void)   { if (gMSP > 0) gM = gMStack[--gMSP]; }
 static void GXTrans(float x, float y, float z) { gM = MatrixMultiply(MatrixTranslate(x, y, z), gM); }
 static void GXRot(float deg, float ax, float ay, float az) { gM = MatrixMultiply(MatrixRotate((Vector3){ ax, ay, az }, deg * DEG2RAD), gM); }
 static void GXScale(float x, float y, float z) { gM = MatrixMultiply(MatrixScale(x, y, z), gM); }
+// put a fit on the current transform; (ox,oz) = the tile centre for world-axes drawing, (0,0) inside a frame
+static void FitApplyAt(Fit f, float ox, float oz) {
+    GXTrans(ox + f.ccx, 0.0f, oz + f.ccz); GXScale(f.kx, 1.0f, f.kz); GXTrans(-(ox + f.ncx), 0.0f, -(oz + f.ncz));
+}
 
 static Color ShadeF(Color c, float k) { return (Color){ (unsigned char)(c.r * k), (unsigned char)(c.g * k), (unsigned char)(c.b * k), c.a }; }
 
@@ -1126,7 +1263,7 @@ static void BuildCommunity(int id, int x0, int y0, int x1, int y1, int laneY, in
             if (y < laneY) face = (y == laneY - 1) ? 1 : 0;
             else           face = (y == laneY + 1) ? 0 : 1;
             faceDir[y][x] = (unsigned char)face;
-            if (Rf() < 0.78f) { drive[y][x] = (unsigned char)(RandModel() + 1); drvCol[y][x] = (unsigned char)GetRandomValue(0, N_CARCOL - 1); }
+            // (no car in a compound drive: the house is fitted inside its fence, too small to park one)
         }
     // a small pocket park inside each community
     int px = x1 - 1, py = (laneY > y0) ? laneY - 1 : laneY + 1;
@@ -1599,7 +1736,7 @@ static void ShuttleArrive(Car *c);
 // turning into a lane: is a vehicle already in that lane close to the entry point (so the turn would overlap it)?
 static bool EntryBlocked(const Car *c, int dir) {
     float dxv = (float)DX[dir], dyv = (float)DY[dir];
-    float lane = (c->type == V_BIKE) ? 0.33f : 0.17f;
+    float lane = (c->type == V_BIKE) ? LANE_BIKE : LANE_CAR;
     float px = c->gx + 0.5f + DY[dir] * lane, py = c->gy + 0.5f - DX[dir] * lane;
     for (int j = 0; j < MAX_CARS; j++) {
         const Car *o = &cars[j];
@@ -1821,7 +1958,7 @@ static void UpdateCars(float dt) {
                 if (ctrl[c->gy][c->gx] == C_ROUNDABOUT) { ax += DX[c->dir] * 0.30f; ay += DY[c->dir] * 0.30f; rbScale = c->t; }
                 if (ctrl[c->ty][c->tx] == C_ROUNDABOUT) { bx -= DX[c->dir] * 0.30f; by -= DY[c->dir] * 0.30f; rbScale = 1.0f - c->t; }
                 // left-hand traffic: drive on the left of the heading; cyclists hug the kerb
-                float lane = (c->type == V_BIKE) ? 0.33f : 0.17f;
+                float lane = (c->type == V_BIKE) ? LANE_BIKE : LANE_CAR;
                 float tox = DY[c->dir] * lane * rbScale, toy = -DX[c->dir] * lane * rbScale;
                 float k = Clamp(dt * 8.0f, 0.0f, 1.0f);
                 c->ox += (tox - c->ox) * k;
@@ -1899,8 +2036,8 @@ static void UpdateParking(void) {
 
     // ---- gated community driveways --------------------------------------------
     int id = GetRandomValue(Z_GATED1, Z_GATED3);
-    int rx, ry;
-    if (!GateRoad(id, &rx, &ry)) return;
+    int rx = 0, ry = 0;
+    if (ZoneFenced(id) || !GateRoad(id, &rx, &ry)) return;   // gated compounds keep cars off the drives
     int houses = 0, withCar = 0;
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++)
@@ -3122,13 +3259,9 @@ static void UpdatePlus(float dt) {
 // ---------------------------------------------------------------------------
 static float FpWorldMaxX(void) { return (float)MAP_W + (smartCity ? (float)FARM_W : 0.0f) + 4.0f; }
 
-static float FpGround(float px, float pz) {                 // pavement height under a point
-    int tx = (int)floorf(px), ty = (int)floorf(pz);
-    if (!InBounds(tx, ty)) return 0.03f;
-    int s = surface[ty][tx];
-    if (s == T_ROAD || s == T_PARK) return 0.06f;
-    if (paved[ty][tx]) return 0.04f;
-    return 0.03f;
+static float FpGround(float px, float pz) {                 // standing height under a point: the same flat level everywhere
+    (void)px; (void)pz;
+    return WALK_TOP;
 }
 
 static bool FpOnRoad(float px, float pz) {
@@ -3155,14 +3288,22 @@ static bool FpSolid(float px, float pz) {
     int s = surface[ty][tx];
     switch (s) {
         case T_BUILDING:
-            if (fabsf(dx) < 0.425f && fabsf(dz) < 0.425f) return true;
+            if (FitHit(FitIn(tx, ty, RoadSide(tx, ty), -0.475f, 0.475f, -0.475f, 0.475f), RoadSide(tx, ty), dx, dz)) return true;
             break;
-        case T_FIRE_STN: case T_POLICE_STN: case T_POWER: case T_WATER: case T_HOSPITAL:
-            if (fabsf(dx) < 0.40f && fabsf(dz) < 0.40f) return true;
+        case T_FIRE_STN: case T_POLICE_STN:
+            if (FitHit(FitIn(tx, ty, faceDir[ty][tx], -0.49f, 0.49f, -0.46f, 0.46f), faceDir[ty][tx], dx, dz)) return true;
             break;
-        case T_MALL:
-            if (fabsf(dx) < 0.46f && fabsf(dz) < 0.46f) return true;
+        case T_POWER: case T_WATER:
+            if (FitHit(FitIn(tx, ty, -1, -0.46f, 0.46f, -0.46f, 0.46f), -1, dx, dz)) return true;
             break;
+        case T_HOSPITAL:
+            if (FitHit(FitIn(tx, ty, faceDir[ty][tx], -0.46f, 0.46f, -0.37f, 0.49f), faceDir[ty][tx], dx, dz)) return true;
+            break;
+        case T_MALL: {
+            float mx0, mx1, mz0, mz1;
+            MallRect(tx, ty, &mx0, &mx1, &mz0, &mz1);
+            if (px >= mx0 && px <= mx1 && pz >= mz0 && pz <= mz1) return true;
+            break; }
         case T_RUIN:
             if (fabsf(dx) < 0.34f && fabsf(dz) < 0.34f) return true;
             break;
@@ -3170,11 +3311,13 @@ static bool FpSolid(float px, float pz) {
             if (dx * dx + dz * dz < 0.07f * 0.07f) return true;
             break;
         case T_LANDFILL:
-            if (IsRecycleTile(tx, ty) && !gateTile[ty][tx] && fabsf(dx) < 0.42f && fabsf(dz) < 0.42f) return true;
+            if (IsRecycleTile(tx, ty) && !gateTile[ty][tx] && FitHit(FitIn(tx, ty, -1, -0.48f, 0.48f, -0.48f, 0.48f), -1, dx, dz)) return true;
             break;
         case T_HOUSE: {
-            float th = FaceYaw(faceDir[ty][tx]) * DEG2RAD, c = cosf(th), sn = sinf(th);
-            float lx = dx * c - dz * sn, lz = dx * sn + dz * c;
+            int hd = faceDir[ty][tx];
+            Fit hf = HouseFit(tx, ty);
+            float lx = dx * DY[hd] - dz * DX[hd], lz = dx * DX[hd] + dz * DY[hd];      // the house's own frame ...
+            lx = hf.ncx + (lx - hf.ccx) / hf.kx; lz = hf.ncz + (lz - hf.ccz) / hf.kz;  // ... and back to its natural size
             if (lx > HS_CX - HS_W * 0.5f - 0.01f && lx < HS_GX + HS_GW * 0.5f + 0.01f && lz > HS_CZ - HS_L * 0.5f - 0.01f && lz < HS_CZ + HS_L * 0.5f + 0.01f) return true;   // body + garage
             break; }
         default:
@@ -3187,10 +3330,15 @@ static bool FpSolid(float px, float pz) {
             int nx = tx + DX[d], ny = ty + DY[d];
             if (InBounds(nx, ny) && zone[ny][nx] == z) continue;
             float along = dx * DX[d] + dz * DY[d];
-            if (along <= FENCE_LINE) continue;
+            float fl = FenceLine(tx, ty, d);                           // the fence is a thin barrier on its line ...
+            if (along <= fl - 0.04f || along > fl + 0.01f) continue;
+            float across = dx * DY[d] - dz * DX[d];                    // ... that runs only as far as it is drawn
+            if (across < -FenceEnd(tx, ty, z, d, -1) || across > FenceEnd(tx, ty, z, d, 1)) continue;
             if (HouseGateEdge(tx, ty) && d == faceDir[ty][tx]) {                       // a house's own gateway (local X = (DY,-DX))
                 float lxT = dx * DY[d] - dz * DX[d];
-                if (fabsf(lxT - HS_GATE_X) < HS_GATE_HW) continue;
+                float gc, gh;
+                HouseGate(tx, ty, &gc, &gh);
+                if (fabsf(lxT - gc) < gh) continue;
             }
             bool gate = gateTile[ty][tx] && IsRoad(nx, ny);
             float perp = fabsf(dx * (float)abs(DY[d]) + dz * (float)abs(DX[d]));
@@ -3254,6 +3402,7 @@ static float LerpAngleRad(float a, float b, float t) {
 static float SmoothK(float t) { t = Clamp(t, 0.0f, 1.0f); return t * t * (3.0f - 2.0f * t); }
 
 // ---- parked cars on the streets (always present, can be entered) -------------------------------
+#define PARK_SIDE 0.245f   // street-parked cars: just outside the traffic lane, clear of the sidewalk
 static void InitFp(void) {
     memset(ucars, 0, sizeof(ucars));
     memset(&fp, 0, sizeof(fp));
@@ -3272,11 +3421,11 @@ static void InitFp(void) {
         int type; do type = RandTrafficType(); while (type == V_TRUCK || type == V_BIKE);
         UCar *u = &ucars[n++];
         u->active = true; u->type = type; u->colIdx = GetRandomValue(0, N_CARCOL - 1);
-        float side = (GetRandomValue(0, 1) ? 1.0f : -1.0f) * 0.37f, along = (Rf() - 0.5f) * 0.3f;
+        float side = (GetRandomValue(0, 1) ? 1.0f : -1.0f) * PARK_SIDE, along = (Rf() - 0.5f) * 0.3f;
         u->x = x + 0.5f + (ns ? side : along);
         u->z = y + 0.5f + (ns ? along : side);
         u->yaw = ns ? (GetRandomValue(0, 1) ? 0.0f : 180.0f) : (GetRandomValue(0, 1) ? 90.0f : 270.0f);
-        u->gy = 0.06f;
+        u->gy = WALK_TOP;
     }
 }
 
@@ -4235,7 +4384,6 @@ static Color RoofColor(unsigned char v) {
     static const Color r[5] = { {150,70,55,255}, {85,88,98,255}, {120,85,60,255}, {70,100,80,255}, {140,60,60,255} };
     return r[(v >> 3) % 5];
 }
-static bool ZoneFenced(int z) { return z >= Z_GATED1 && z <= Z_LANDFILL; }
 
 static void DrawZebra2D(int x, int y) {
     int px = x * TILE, py = y * TILE;
@@ -4882,6 +5030,7 @@ static void DrawHouse3D(int x, int y) {
     int rtype = (v >> 1) % 4;
     bool lit = NightNow() && !dmg && (v & 4);
     PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(f));
+    FitApplyAt(HouseFit(x, y), 0.0f, 0.0f);
 
     // main block and roof (the roof is built on the same footprint as the walls, so it sits flush)
     BoxT(wallTex, HS_CX, HS_WH * 0.5f, HS_CZ, HS_W, HS_WH, HS_L, wall);
@@ -4913,10 +5062,10 @@ static void DrawHouse3D(int x, int y) {
 
     // driveway, garden path, garden (the parked car is drawn live, see DrawHouseDrive3D). Everything stays
     // inside FENCE_LINE, so a house on the community edge never reaches its fence.
-    BoxC(HS_GX, 0.006f, 0.28f, 0.16f, 0.012f, 0.32f, A((Color){ 165, 165, 168, 255 }));       // drive: garage front to fence
+    BoxC(HS_GX, WALK_TOP * 0.5f, 0.28f, 0.16f, WALK_TOP, 0.32f, A((Color){ 165, 165, 168, 255 }));       // drive: garage front to fence
     float pz0 = HS_CZ + HS_L * 0.5f;                                                          // front wall
-    BoxC(HS_CX - 0.08f, 0.004f, pz0 + 0.10f, 0.07f, 0.008f, 0.20f, A((Color){ 205, 195, 175, 255 }));   // path: door to the gateway
-    BoxC(-0.04f, 0.004f, 0.30f, 0.28f, 0.008f, 0.07f, A((Color){ 205, 195, 175, 255 }));
+    BoxC(HS_CX - 0.08f, WALK_TOP * 0.5f, pz0 + 0.10f, 0.07f, WALK_TOP, 0.20f, A((Color){ 205, 195, 175, 255 }));   // path: door to the gateway
+    BoxC(-0.04f, WALK_TOP * 0.5f, 0.30f, 0.28f, WALK_TOP, 0.07f, A((Color){ 205, 195, 175, 255 }));
     GSphere(V3(-0.36f, 0.04f, 0.22f), 0.05f, A((Color){ 48, 125, 55, 255 }));
     GSphere(V3(-0.30f, 0.035f, 0.36f), 0.04f, A((Color){ 62, 145, 62, 255 }));
     for (int k = 0; k < 4; k++)
@@ -4937,7 +5086,7 @@ static void DrawHouse3D(int x, int y) {
 static void DrawHouseDrive3D(int x, int y) {
     if (!drive[y][x] || surface[y][x] != T_HOUSE) return;
     PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(faceDir[y][x]));
-    PushFrame(HS_GX, 0.008f, HS_DRV_Z, 0.0f);
+    PushFrame(HS_GX, WALK_TOP, HS_DRV_Z, 0.0f);
     DrawVehicleLocal(drive[y][x] - 1, CAR_COLS[drvCol[y][x]], false, NightNow());
     PopFrame();
     PopFrame();
@@ -4945,15 +5094,12 @@ static void DrawHouseDrive3D(int x, int y) {
 // ---------------------------------------------------------------------------
 // 3D drawing - other buildings
 // ---------------------------------------------------------------------------
-static int RoadSide(int x, int y) {          // direction of the nearest road (for entrances)
-    for (int d = 0; d < 4; d++) if (IsRoad(x + DX[d], y + DY[d])) return d;
-    return 1;
-}
 
+static int BldFloors(float h) { return (int)(h * 10.0f * 1.15f + 0.5f); }   // a little taller than the simulation's storey count
 static void DrawBuilding3D(int x, int y) {
     unsigned char v = vr[y][x];
     float h = bHeight[y][x], cx = x + 0.5f, cz = y + 0.5f;
-    int fl = (int)(h * 10.0f + 0.5f);
+    int fl = BldFloors(h);
     if (fl < 1) fl = 1;
     bool dmg = health[y][x] < 50.0f, night = NightNow();
     float H = fl * FLOOR_H;                                       // building height (tile units)
@@ -4962,50 +5108,52 @@ static void DrawBuilding3D(int x, int y) {
     int wt = (bType[y][x] == B_COM) ? (fl >= 8 ? (night ? TX_WIN_GLASS_N : TX_WIN_GLASS) : (night ? TX_WIN_OFFICE_N : TX_WIN_OFFICE))
                                     : (night ? TX_WIN_BRICK_N : TX_WIN_BRICK);
     PushFrame(cx, 0, cz, FaceYaw(side));
+    FitApplyAt(FitIn(x, y, side, -0.475f, 0.475f, -0.475f, 0.475f), 0.0f, 0.0f);
     if (fl >= 10) {                                   // skyrise: podium, tower, crown (the beacon is live)
         int f1 = fl * 35 / 100; if (f1 < 2) f1 = 2;
         int f2 = fl - f1;
         float h1 = f1 * FLOOR_H, h2 = f2 * FLOOR_H;
-        WindowBox(wt, f1, 0, h1 / 2, 0, 0.84f, h1, 0.84f, tint);
-        WindowBox(wt, f2, 0, h1 + h2 / 2, 0, 0.66f, h2, 0.66f, tint);
-        BoxC(0, h1 + 0.005f, 0, 0.86f, 0.012f, 0.86f, A((Color){ 120, 122, 128, 255 }));        // podium ledge
-        BoxC(0, H + 0.02f, 0, 0.70f, 0.04f, 0.70f, A((Color){ 105, 108, 115, 255 }));           // crown
+        WindowBox(wt, f1, 0, h1 / 2, 0, BLD_PODIUM, h1, BLD_PODIUM, tint);
+        WindowBox(wt, f2, 0, h1 + h2 / 2, 0, BLD_TOWER, h2, BLD_TOWER, tint);
+        BoxC(0, h1 + 0.005f, 0, BLD_PODIUM + 0.02f, 0.012f, BLD_PODIUM + 0.02f, A((Color){ 120, 122, 128, 255 }));        // podium ledge
+        BoxC(0, H + 0.02f, 0, BLD_TOWER + 0.04f, 0.04f, BLD_TOWER + 0.04f, A((Color){ 105, 108, 115, 255 }));           // crown
         BoxC(0.14f, H + 0.07f, 0.12f, 0.16f, 0.06f, 0.14f, A((Color){ 150, 152, 158, 255 }));   // plant room
         BoxC(-0.12f, H + 0.18f, -0.12f, 0.012f, 0.28f, 0.012f, A((Color){ 200, 200, 205, 255 })); // mast
-        BoxC(0, 0.04f, 0.43f, 0.32f, 0.08f, 0.02f, A((Color){ 40, 50, 60, 255 }));              // lobby doors
+        BoxC(0, 0.04f, BLD_PODIUM * 0.5f + 0.03f, 0.32f, 0.08f, 0.02f, A((Color){ 40, 50, 60, 255 }));              // lobby doors
         if (smartCity && !dmg) {                                                                  // smart city: green facades + roof solar
-            LivingWall(0.0f, f1, 0.84f, 3);
-            LivingWall(h1, f2, 0.66f, 1);
+            LivingWall(0.0f, f1, BLD_PODIUM, 3);
+            LivingWall(h1, f2, BLD_TOWER, 1);
             RooftopGarden3D(H);
             SolarPanel(-0.20f, H + 0.065f, 0.18f, 0.15f, 0.11f, 12.0f);
             SolarPanel( 0.20f, H + 0.065f, 0.20f, 0.15f, 0.11f, 12.0f);
             SolarPanel( 0.00f, H + 0.065f, -0.05f, 0.15f, 0.11f, 12.0f);
         }
     } else {
-        WindowBox(wt, fl, 0, H / 2, 0, 0.85f, H, 0.85f, tint);
-        if (bType[y][x] == B_RES && fl <= 4 && (v & 1)) RoofGable(0.90f, 0.90f, H, 0.14f, (v & 2) != 0, A((Color){ 150, 100, 90, 255 }), TX_BRICK, A(WHITE));
-        else BoxC(0, H + 0.01f, 0, 0.90f, 0.03f, 0.90f, A((Color){ 112, 114, 120, 255 }));
+        WindowBox(wt, fl, 0, H / 2, 0, BLD_W, H, BLD_W, tint);
+        if (bType[y][x] == B_RES && fl <= 4 && (v & 1)) RoofGable(BLD_W + 0.02f, BLD_W + 0.02f, H, 0.14f, (v & 2) != 0, A((Color){ 150, 100, 90, 255 }), TX_BRICK, A(WHITE));
+        else BoxC(0, H + 0.01f, 0, BLD_W + 0.02f, 0.03f, BLD_W + 0.02f, A((Color){ 112, 114, 120, 255 }));
         BoxC(-0.16f, H + 0.05f, 0.12f, 0.13f, 0.05f, 0.14f, A((Color){ 150, 152, 158, 255 }));
-        if (GreenRoof(x, y)) GreenRoof3D(H + 0.032f, 0.0f, 0.0f, 0.85f, 0.85f);
+        if (GreenRoof(x, y)) GreenRoof3D(H + 0.032f, 0.0f, 0.0f, BLD_W, BLD_W);
         if (smartCity && !dmg) {
             if (bType[y][x] == B_RES && fl <= 4 && (v & 1)) GableSolar((v & 2) != 0, 0.45f, H, 0.14f, 0.08f, 0.38f, 0.32f);
             else FlatSolar(0.0f, -0.14f, H + 0.045f, 3, 2, 0.24f, 0.20f, 0.20f, 0.14f, 12.0f);
         }
         if (bType[y][x] == B_COM && fl < 8) {          // shop awning
             Color aw = (v & 1) ? (Color){ 200, 60, 60, 255 } : (Color){ 60, 120, 190, 255 };
-            BoxC(0, 0.11f, 0.45f, 0.70f, 0.02f, 0.10f, A(aw));
+            BoxC(0, 0.11f, BLD_W * 0.5f + 0.03f, 0.70f, 0.02f, 0.10f, A(aw));
         }
-        BoxC(0, 0.04f, 0.43f, 0.20f, 0.08f, 0.012f, A((Color){ 45, 50, 60, 255 }));
+        BoxC(0, 0.04f, BLD_W * 0.5f + 0.005f, 0.20f, 0.08f, 0.012f, A((Color){ 45, 50, 60, 255 }));
     }
     PopFrame();
 }
 
 // skyrise beacon (blinks at night)
 static void DrawBuildingLive3D(int x, int y) {
-    int fl = (int)(bHeight[y][x] * 10.0f + 0.5f);
+    int fl = BldFloors(bHeight[y][x]);
     if (fl < 10) return;
     float H = fl * FLOOR_H;
     PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(RoadSide(x, y)));
+    FitApplyAt(FitIn(x, y, RoadSide(x, y), -0.475f, 0.475f, -0.475f, 0.475f), 0.0f, 0.0f);
     if (NightNow() || (int)(GetTime() * 1.2f) % 2) GSphere(V3(-0.12f, H + 0.33f, -0.12f), 0.016f, RED);
     PopFrame();
 }
@@ -5015,6 +5163,7 @@ static void DrawIndustrial3D(int x, int y) {
     bool dmg = health[y][x] < 50.0f;
     Color tint = A(dmg ? (Color){ 120, 100, 95, 255 } : WHITE);
     PushFrame(cx, 0, cz, FaceYaw(RoadSide(x, y)));
+    FitApplyAt(FitIn(x, y, RoadSide(x, y), -0.475f, 0.475f, -0.475f, 0.475f), 0.0f, 0.0f);
     if (deco[y][x] == 0) {              // factory with chimney and vents
         BoxT(TX_CORRUG, 0, h / 2, 0, 0.84f, h, 0.72f, tint);
         for (int k = 0; k < 3; k++) { GXPush(); GXTrans(-0.28f + k * 0.28f, 0, 0); RoofGable(0.28f, 0.72f, h, 0.07f, true, A((Color){ 140, 145, 150, 255 }), TX_CORRUG, tint); GXPop(); }
@@ -5063,10 +5212,9 @@ static void DrawYard3D(int x, int y) {          // loading yard: stacked contain
 }
 
 static void DrawMall3D(int x, int y) {
-    float m = 0.05f;
-    bool w = (surface[y][x - 1 < 0 ? 0 : x - 1] == T_MALL) && x > 0, e = (x + 1 < MAP_W) && surface[y][x + 1] == T_MALL;
     bool n = (y > 0) && surface[y - 1][x] == T_MALL, s = (y + 1 < MAP_H) && surface[y + 1][x] == T_MALL;
-    float x0 = x + (w ? 0 : m), x1 = x + 1 - (e ? 0 : m), z0 = y + (n ? 0 : m), z1 = y + 1 - (s ? 0 : m);
+    float x0, x1, z0, z1;
+    MallRect(x, y, &x0, &x1, &z0, &z1);
     float hh = bHeight[y][x] + 0.04f;
     float cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
     BoxT(TX_CONCRETE, cx, hh / 2, cz, x1 - x0, hh, z1 - z0, A((Color){ 235, 225, 205, 255 }));
@@ -5088,7 +5236,7 @@ static void DrawParkingLot3D(int x, int y) {
     float cx = x + 0.5f, cz = y + 0.5f;
     for (int c = 0; c <= 4; c++)
         for (int r = 0; r < 2; r++)
-            BoxC(x + c * 0.25f, 0.066f, y + 0.30f + r * 0.40f, 0.012f, 0.004f, 0.34f, A((Color){ 240, 240, 240, 255 }));
+            BoxC(x + c * 0.25f, GROUND_TOP + 0.006f, y + 0.30f + r * 0.40f, 0.012f, 0.004f, 0.34f, A((Color){ 240, 240, 240, 255 }));
     if (((x + y) & 1) == 0) {               // lamp posts (the glow is live)
         BoxC(cx, 0.18f, cz, 0.014f, 0.36f, 0.014f, A((Color){ 70, 72, 78, 255 }));
         BoxC(cx, 0.37f, cz, 0.07f, 0.014f, 0.03f, A((Color){ 70, 72, 78, 255 }));
@@ -5101,7 +5249,7 @@ static void DrawParkingLive3D(int x, int y) {
     for (int s = 0; s < 8; s++) {
         if (!lot[y][x][s]) continue;
         int col = s % 4, row = s / 4;
-        PushFrame(x + (col + 0.5f) * 0.25f, 0.06f, y + 0.30f + row * 0.40f, row ? 180.0f : 0.0f);
+        PushFrame(x + (col + 0.5f) * 0.25f, WALK_TOP, y + 0.30f + row * 0.40f, row ? 180.0f : 0.0f);
         DrawVehicleLocal(lot[y][x][s] - 1, CAR_COLS[lotCol[y][x][s]], false, NightNow());
         PopFrame();
     }
@@ -5132,7 +5280,7 @@ static void DrawLandfillMounds3D(int x, int y) {
     float cx = x + 0.5f, cz = y + 0.5f;
     for (int k = 0; k < 3; k++) {
         float r = 0.12f + 0.04f * ((v >> k) & 3);                  // 0.12 .. 0.24 tile
-        float lim = FENCE_LINE - 0.07f - r;                       // fence stands at FENCE_LINE from the tile centre
+        float lim = FENCE_ROAD - 0.07f - r;                       // fence stands at FENCE_LINE from the tile centre
         float ox = (((v >> (k * 2)) & 3) - 1.5f) * 0.20f, oz = (((v >> (k + 3)) & 3) - 1.5f) * 0.20f;
         ox = Clamp(ox, -lim, lim); oz = Clamp(oz, -lim, lim);
         float hh = bHeight[y][x] * fillK * (0.8f + 0.25f * k);
@@ -5155,9 +5303,10 @@ static void DrawRuin3D(int x, int y) {
 static void DrawStation3D(int x, int y, bool fire) {
     float cx = x + 0.5f, cz = y + 0.5f;
     PushFrame(cx, 0, cz, FaceYaw(faceDir[y][x]));
+    FitApplyAt(FitIn(x, y, faceDir[y][x], -0.49f, 0.49f, -0.46f, 0.46f), 0.0f, 0.0f);
     Color main = fire ? (Color){ 205, 62, 55, 255 } : (Color){ 235, 238, 245, 255 };
-    BoxT(TX_BRICK, 0, 0.20f, 0, 0.88f, 0.40f, 0.84f, A(fire ? (Color){ 255, 190, 180, 255 } : (Color){ 200, 215, 245, 255 }));
-    BoxC(0, 0.415f, 0, 0.92f, 0.03f, 0.88f, A(Shade(main, 0.7f)));
+    BoxT(TX_BRICK, 0, 0.20f, 0, 0.96f, 0.40f, 0.92f, A(fire ? (Color){ 255, 190, 180, 255 } : (Color){ 200, 215, 245, 255 }));
+    BoxC(0, 0.415f, 0, 0.98f, 0.03f, 0.96f, A(Shade(main, 0.7f)));
     if (fire) {
         for (int k = 0; k < 2; k++) {
             BoxC(-0.21f + k * 0.42f, 0.14f, 0.425f, 0.32f, 0.26f, 0.008f, A((Color){ 235, 235, 238, 255 }));
@@ -5205,8 +5354,8 @@ static void DrawStructureStatic3D(int x, int y) {
         case T_HOUSE:    DrawHouse3D(x, y); break;
         case T_MALL:     DrawMall3D(x, y); break;
         case T_RUIN:     DrawRuin3D(x, y); break;
-        case T_POWER:    if (!smartCity) DrawPlant3D(x, y); break;
-        case T_WATER:    DrawWorks3D(x, y); break;
+        case T_POWER:    if (!smartCity) { GXPush(); FitApplyAt(FitIn(x, y, -1, -0.46f, 0.46f, -0.46f, 0.46f), x + 0.5f, y + 0.5f); DrawPlant3D(x, y); GXPop(); } break;
+        case T_WATER:    GXPush(); FitApplyAt(FitIn(x, y, -1, -0.46f, 0.46f, -0.46f, 0.46f), x + 0.5f, y + 0.5f); DrawWorks3D(x, y); GXPop(); break;
         case T_LANDFILL: if (!(IsRecycleTile(x, y) && !gateTile[y][x])) DrawLandfill3D(x, y); break;
         case T_PARK:     DrawParkingLot3D(x, y); break;
         default: break;
@@ -5220,31 +5369,25 @@ static void DrawStructureLive3D(int x, int y) {
         case T_PARK:     DrawParkingLive3D(x, y); break;
         case T_FIRE_STN: DrawStation3D(x, y, true); break;
         case T_POLICE_STN: DrawStation3D(x, y, false); break;
-        case T_POWER:    if (smartCity) DrawBattery3D(x, y); break;
+        case T_POWER:    if (smartCity) { GXPush(); FitApplyAt(FitIn(x, y, -1, -0.46f, 0.46f, -0.46f, 0.46f), x + 0.5f, y + 0.5f); DrawBattery3D(x, y); GXPop(); } break;
         case T_HOSPITAL: DrawHospital3D(x, y); break;
-        case T_LANDFILL: if (IsRecycleTile(x, y) && !gateTile[y][x]) DrawRecycle3D(x, y); else DrawLandfillMounds3D(x, y); break;
+        case T_LANDFILL:
+            if (IsRecycleTile(x, y) && !gateTile[y][x]) { GXPush(); FitApplyAt(FitIn(x, y, -1, -0.48f, 0.48f, -0.48f, 0.48f), x + 0.5f, y + 0.5f); DrawRecycle3D(x, y); GXPop(); }
+            else DrawLandfillMounds3D(x, y);
+            break;
         default: break;
     }
 }
 // ---------------------------------------------------------------------------
 // 3D drawing - fences, gates, traffic lights, junction furniture
 // ---------------------------------------------------------------------------
-// fence segments: each edge runs on its own line FENCE_LINE from the tile centre. An end that meets a
-// fence on the same line runs to the tile edge; an end at a corner stops at the corner, so the
-// segments meet and never run through each other.
-static float FenceEnd(int x, int y, int z, int d, int sgn) {
-    int tx = DY[d] * sgn, ty = -DX[d] * sgn;                       // tangent (local +x is (DY,-DX))
-    int nx = x + tx, ny = y + ty;
-    if (!InBounds(nx, ny) || zone[ny][nx] != z) return FENCE_LINE; // corner or free end
-    int ox = nx + DX[d], oy = ny + DY[d];
-    bool sameLine = !(InBounds(ox, oy) && zone[oy][ox] == z);      // the neighbour's own edge on this side is fenced too
-    return sameLine ? 0.5f : FENCE_LINE;
-}
-// one straight run of fence along the edge, from local x = xa to xb
-static void DrawFenceRun(float xa, float xb, bool picket) {
+// fence segments: each edge runs on its own line (FenceLine: the sidewalk's inner edge beside a road, otherwise
+// further in). An end that meets a fence on the same line runs to the tile edge; an end at a corner stops where
+// the perpendicular fence stands, so the segments meet and never run through each other.
+// one straight run of fence along the edge, from local x = xa to xb, on the line `inset`
+static void DrawFenceRun(float xa, float xb, bool picket, float inset) {
     float len = xb - xa, xc = 0.5f * (xa + xb);
     if (len <= 0.005f) return;
-    const float inset = FENCE_LINE;
     if (picket) {
         int n = (int)(len / 0.11f + 0.5f); if (n < 2) n = 2;
         BoxC(xc, 0.070f, inset, len, 0.012f, 0.010f, A(WHITE));
@@ -5260,19 +5403,18 @@ static void DrawFenceRun(float xa, float xb, bool picket) {
         BoxC(xc, 0.232f, inset, len, 0.004f, 0.004f, A((Color){ 60, 60, 64, 255 }));
     }
 }
-// a gateway into a house's front yard: brick piers either side, a lintel, and the leaves folded back flat
-static void DrawHouseGateway(bool picket) {
-    const float inset = FENCE_LINE;
-    float g0 = HS_GATE_X - HS_GATE_HW, g1 = HS_GATE_X + HS_GATE_HW;
+// a gateway into a house's front yard, centred at gc with half width hw: brick piers, a lintel, and the leaves folded back flat
+static void DrawHouseGateway(bool picket, float inset, float gc, float hw) {
+    float g0 = gc - hw, g1 = gc + hw, pz = inset - 0.02f;         // piers stand just inside the fence line
     Color cap = A((Color){ 150, 140, 125, 255 }), leaf = picket ? A((Color){ 246, 246, 240, 255 }) : A((Color){ 120, 124, 130, 255 });
     for (int s = -1; s <= 1; s += 2) {
         float px = (s < 0) ? g0 - 0.035f : g1 + 0.035f;
-        BoxT(TX_BRICK, px, 0.13f, inset, 0.07f, 0.26f, 0.07f, A(WHITE));
-        BoxC(px, 0.265f, inset, 0.09f, 0.02f, 0.09f, cap);
-        if (NightNow()) GSphere(V3(px, 0.29f, inset), 0.018f, (Color){ 255, 235, 160, 255 });
+        BoxT(TX_BRICK, px, 0.13f, pz, 0.07f, 0.26f, 0.05f, A(WHITE));
+        BoxC(px, 0.265f, pz, 0.09f, 0.02f, 0.05f, cap);
+        if (NightNow()) GSphere(V3(px, 0.29f, pz), 0.018f, (Color){ 255, 235, 160, 255 });
         BoxC((s < 0) ? g0 + 0.03f : g1 - 0.03f, 0.10f, inset - 0.004f, 0.06f, 0.20f, 0.008f, leaf);     // leaf folded back against the pier
     }
-    BoxC(HS_GATE_X, 0.25f, inset, g1 - g0 + 0.07f, 0.02f, 0.012f, cap);                                 // lintel
+    BoxC(gc, 0.25f, inset, g1 - g0 + 0.07f, 0.02f, 0.012f, cap);                                        // lintel
 }
 static void DrawFences3D(void) {
     for (int y = 0; y < MAP_H; y++)
@@ -5284,13 +5426,13 @@ static void DrawFences3D(void) {
                 int nx = x + DX[d], ny = y + DY[d];
                 if (InBounds(nx, ny) && zone[ny][nx] == z) continue;
                 bool gate = gateTile[y][x] && IsRoad(nx, ny);
-                float inset = FENCE_LINE;
+                float inset = FenceLine(x, y, d);
                 PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(d));
                 if (gate) {
                     Color pil = A((Color){ 150, 140, 125, 255 });
                     for (int s = -1; s <= 1; s += 2) {
-                        BoxT(TX_BRICK, s * 0.30f, 0.11f, inset, 0.07f, 0.22f, 0.07f, A(WHITE));
-                        BoxC(s * 0.30f, 0.225f, inset, 0.09f, 0.012f, 0.09f, pil);
+                        BoxT(TX_BRICK, s * 0.30f, 0.11f, inset - 0.02f, 0.07f, 0.22f, 0.05f, A(WHITE));
+                        BoxC(s * 0.30f, 0.225f, inset - 0.02f, 0.09f, 0.012f, 0.05f, pil);
                     }
                     BoxC(-0.26f, 0.09f, inset, 0.16f, 0.012f, 0.012f, A((Color){ 235, 190, 40, 255 }));          // gate leaves (open)
                     BoxC(-0.26f, 0.05f, inset, 0.16f, 0.012f, 0.012f, A((Color){ 235, 190, 40, 255 }));
@@ -5298,10 +5440,21 @@ static void DrawFences3D(void) {
                 } else {
                     float eL = FenceEnd(x, y, z, d, -1), eR = FenceEnd(x, y, z, d, 1);
                     if (HouseGateEdge(x, y) && d == faceDir[y][x]) {       // this house's front door faces the fence: leave a gateway
-                        DrawFenceRun(-eL, HS_GATE_X - HS_GATE_HW, picket);
-                        DrawFenceRun(HS_GATE_X + HS_GATE_HW, eR, picket);
-                        DrawHouseGateway(picket);
-                    } else DrawFenceRun(-eL, eR, picket);
+                        float gc, gh;
+                        HouseGate(x, y, &gc, &gh);
+                        DrawFenceRun(-eL, gc - gh, picket, inset);
+                        DrawFenceRun(gc + gh, eR, picket, inset);
+                        DrawHouseGateway(picket, inset, gc, gh);
+                    } else DrawFenceRun(-eL, eR, picket, inset);
+                    // where the fence steps to the next tile's line, bridge the step at the shared edge
+                    int ox = x + DY[d], oy = y - DX[d];                    // the tile on this edge's +x side
+                    if (InBounds(ox, oy) && zone[oy][ox] == z && FencedSide(ox, oy, d)) {
+                        float other = FenceLine(ox, oy, d);
+                        if (fabsf(other - inset) > 0.001f) {
+                            float a = inset < other ? inset : other, b = inset < other ? other : inset;
+                            BoxC(0.5f, 0.11f, 0.5f * (a + b), 0.016f, 0.22f, b - a + 0.016f, A((Color){ 90, 94, 100, 255 }));
+                        }
+                    }
                 }
                 PopFrame();
             }
@@ -5318,7 +5471,7 @@ static void DrawFencesLive3D(void) {
                 int nx = x + DX[d], ny = y + DY[d];
                 if (!(InBounds(nx, ny) && zone[ny][nx] != z && IsRoad(nx, ny))) continue;
                 PushFrame(x + 0.5f, 0, y + 0.5f, FaceYaw(d));
-                float inset = FENCE_LINE;
+                float inset = FenceLine(x, y, d);
                 for (int s = -1; s <= 1; s += 2)
                     if (NightNow()) GSphere(V3(s * 0.30f, 0.23f, inset), 0.018f, (Color){ 255, 235, 160, 255 });
                 BoxC(0.0f, 0.05f, inset, 0.50f, 0.01f, 0.01f, A(((int)(GetTime() * 1.0) % 2) ? RED : WHITE));   // barrier arm
@@ -5343,6 +5496,7 @@ static void DrawSignalHead(float cx, float cz, float yaw, int state) {
 static void DrawJunction3D(int x, int y, bool xray) {
     float cx = x + 0.5f, cz = y + 0.5f;
     if (ctrl[y][x] == C_ROUNDABOUT) {
+        GXPush(); GXTrans(0.0f, GROUND_TOP - 0.06f, 0.0f);          // the ring was modelled on the old road top
         GCylinder(V3(cx, 0.058f, cz), 0.41f, 0.41f, 0.004f, 36, A((Color){ 190, 190, 192, 255 }));
         GCylinder(V3(cx, 0.061f, cz), 0.37f, 0.37f, 0.004f, 36, A(xray ? COL_ROAD_DIM : COL_ROAD));
         GCylinder(V3(cx, 0.06f, cz), 0.215f, 0.215f, 0.05f, 28, A((Color){ 160, 160, 162, 255 }));
@@ -5353,6 +5507,7 @@ static void DrawJunction3D(int x, int y, bool xray) {
             float a = k * PI / 3.0f;
             GSphere(V3(cx + 0.13f * cosf(a), 0.15f, cz + 0.13f * sinf(a)), 0.016f, A(k & 1 ? (Color){ 240, 90, 120, 255 } : (Color){ 250, 215, 70, 255 }));
         }
+        GXPop();
     } else if (ctrl[y][x] == C_STOP) {
         static const float px[4] = { -0.45f, 0.45f, 0.45f, -0.45f };
         static const float pz[4] = { -0.45f, -0.45f, 0.45f, 0.45f };
@@ -5385,18 +5540,18 @@ static void DrawRoadMarkings3D(int x, int y) {
     if (crossT[y][x]) {
         for (int i = 0; i < 5; i++) {
             float o = (-0.36f + i * 0.18f);
-            if (crossT[y][x] == 1) BoxC(cx + o, 0.063f, cz, 0.07f, 0.004f, 0.30f, A(WHITE));
-            else                   BoxC(cx, 0.063f, cz + o, 0.30f, 0.004f, 0.07f, A(WHITE));
+            if (crossT[y][x] == 1) BoxC(cx + o, GROUND_TOP + 0.003f, cz, 0.07f, 0.004f, 0.30f, A(WHITE));
+            else                   BoxC(cx, GROUND_TOP + 0.003f, cz + o, 0.30f, 0.004f, 0.07f, A(WHITE));
         }
         int ji = crossI[y][x];
         if (ji >= 0 && ctrl[ji / MAP_W][ji % MAP_W] != C_NONE) {
             for (int d = 0; d < 4; d++) {
                 if (x + DX[d] != ji % MAP_W || y + DY[d] != ji / MAP_W) continue;
-                float lane = 0.17f;
+                float lane = LANE_CAR;
                 float lx = DY[d] * lane, lz = -DX[d] * lane;                    // lane of traffic heading toward the junction
                 float bx = cx - DX[d] * 0.26f + lx, bz = cz - DY[d] * 0.26f + lz;
-                if (d < 2) BoxC(bx, 0.063f, bz, 0.30f, 0.004f, 0.025f, A(WHITE));
-                else       BoxC(bx, 0.063f, bz, 0.025f, 0.004f, 0.30f, A(WHITE));
+                if (d < 2) BoxC(bx, GROUND_TOP + 0.003f, bz, 0.30f, 0.004f, 0.025f, A(WHITE));
+                else       BoxC(bx, GROUND_TOP + 0.003f, bz, 0.025f, 0.004f, 0.30f, A(WHITE));
             }
         }
     }
@@ -5584,6 +5739,7 @@ static void DrawHospital3D(int x, int y) {
     bool dmg = health[y][x] < 50.0f;
     Color tint = A(dmg ? (Color){ 120, 100, 95, 255 } : WHITE);
     PushFrame(cx, 0, cz, FaceYaw(faceDir[y][x]));
+    FitApplyAt(FitIn(x, y, faceDir[y][x], -0.46f, 0.46f, -0.37f, 0.49f), 0.0f, 0.0f);
     BoxT(TX_HOSP, 0, 0.17f, -0.02f, 0.90f, 0.34f, 0.70f, tint);
     BoxT(TX_HOSP, -0.22f, 0.37f, -0.12f, 0.36f, 0.74f, 0.36f, tint);
     BoxC(0, 0.355f, -0.02f, 0.94f, 0.03f, 0.74f, A((Color){ 150, 152, 158, 255 }));
@@ -5651,7 +5807,7 @@ static void DrawRecycle3D(int x, int y) {
         BoxC(cx + 0.0f, 0.045f, cz, 0.10f, 0.03f, 0.96f, A((Color){ 55, 58, 64, 255 }));
         for (int i = 0; i < 6; i++) {
             float zz = cz - 0.46f + fmodf(t * 0.35f + i * 0.17f, 1.0f) * 0.92f;
-            BoxC(cx, 0.066f, zz, 0.08f, 0.012f, 0.045f, A(bale[(v + i) % 5]));
+            BoxC(cx, GROUND_TOP + 0.006f, zz, 0.08f, 0.012f, 0.045f, A(bale[(v + i) % 5]));
         }
         for (int i = 0; i < 3; i++) BoxT(TX_CORRUG, cx + 0.34f, 0.07f + (i % 2) * 0.0f, cz - 0.30f + i * 0.30f, 0.20f, 0.12f, 0.18f, A(bale[(v + i) % 5]));
         FlatSolar(cx - 0.05f, cz, 0.30f, 2, 3, 0.36f, 0.22f, 0.30f, 0.18f, 10.0f);
@@ -5707,8 +5863,8 @@ static void DrawFarmStatic3D(void) {
         for (int x = MAP_W; x < MAP_W + FARM_W; x++) {
             bool road = (y == FARM_ROAD_Y);
             if (road) {
-                BoxT(TX_ASPHALT, x + 0.5f, 0.03f, y + 0.5f, 1.0f, 0.06f, 1.0f, WHITE);
-                BoxC(x + 0.5f, 0.066f, y + 0.5f, 0.5f, 0.012f, 0.045f, COL_LINE);
+                BoxT(TX_ASPHALT, x + 0.5f, GROUND_TOP * 0.5f, y + 0.5f, 1.0f, GROUND_TOP, 1.0f, WHITE);
+                BoxC(x + 0.5f, GROUND_TOP + 0.006f, y + 0.5f, 0.5f, 0.012f, 0.045f, COL_LINE);
             } else BoxT(TX_GRASS, x + 0.5f, 0.015f, y + 0.5f, 1.0f, 0.03f, 1.0f, (Color){ 225, 240, 200, 255 });
         }
     // solar field: rows of tilted tables
@@ -5919,8 +6075,8 @@ static void DrawPlusWorld3D(void) {
         GSphere((Vector3){ px, 0.20f, pz }, 0.020f, c);
         if (d >= 0) {
             float gx = FLOOD_POS[i][0] + 0.5f + DX[d] * 0.40f, gz = FLOOD_POS[i][1] + 0.5f + DY[d] * 0.40f;
-            BoxC(gx, 0.066f, gz, DX[d] ? 0.02f : 0.26f, 0.006f, DY[d] ? 0.02f : 0.26f, A((Color){ 40, 44, 50, 255 }));
-            if (drainOpen > 0.1f) BoxC(gx, 0.071f, gz, DX[d] ? 0.02f : 0.22f, 0.004f, DY[d] ? 0.02f : 0.22f, Fade((Color){ 90, 170, 255, 255 }, 0.5f + 0.4f * sinf(t * 6.0f + i)));
+            BoxC(gx, GROUND_TOP + 0.006f, gz, DX[d] ? 0.02f : 0.26f, 0.006f, DY[d] ? 0.02f : 0.26f, A((Color){ 40, 44, 50, 255 }));
+            if (drainOpen > 0.1f) BoxC(gx, GROUND_TOP + 0.011f, gz, DX[d] ? 0.02f : 0.22f, 0.004f, DY[d] ? 0.02f : 0.22f, Fade((Color){ 90, 170, 255, 255 }, 0.5f + 0.4f * sinf(t * 6.0f + i)));
         }
     }
 }
@@ -6339,25 +6495,27 @@ static void DrawGround3D(int x, int y, bool xray) {
     if (s == T_ROAD) {
         if (!layerOn[L_ROADS]) return;
         Color rt = xray ? (Color){ 150, 150, 150, 255 } : WHITE;
-        BoxT(TX_ASPHALT, cx, 0.03f, cz, 1.0f, 0.06f, 1.0f, rt);
+        float rx0 = (InBounds(x - 1, y) && !IsRoad(x - 1, y)) ? ROAD_INSET : 0.0f, rx1 = (InBounds(x + 1, y) && !IsRoad(x + 1, y)) ? 1.0f - ROAD_INSET : 1.0f;
+        float rz0 = (InBounds(x, y - 1) && !IsRoad(x, y - 1)) ? ROAD_INSET : 0.0f, rz1 = (InBounds(x, y + 1) && !IsRoad(x, y + 1)) ? 1.0f - ROAD_INSET : 1.0f;
+        BoxT(TX_ASPHALT, x + (rx0 + rx1) * 0.5f, GROUND_TOP * 0.5f, y + (rz0 + rz1) * 0.5f, rx1 - rx0, GROUND_TOP, rz1 - rz0, rt);
         int ln = RoadLine(x, y);
         Color lc = xray ? (Color){ 150, 150, 150, 255 } : COL_LINE;
-        if (ln == 1) BoxC(cx, 0.066f, cz, 0.5f, 0.012f, 0.045f, lc);
-        else if (ln == 2) BoxC(cx, 0.066f, cz, 0.045f, 0.012f, 0.5f, lc);
+        if (ln == 1) BoxC(cx, GROUND_TOP + 0.006f, cz, 0.5f, 0.012f, 0.045f, lc);
+        else if (ln == 2) BoxC(cx, GROUND_TOP + 0.006f, cz, 0.045f, 0.012f, 0.5f, lc);
         DrawRoadMarkings3D(x, y);
         return;
     }
-    if (xray)                BoxC(cx, 0.015f, cz, 1.0f, 0.03f, 1.0f, COL_SOIL);
-    else if (s == T_PARK)    BoxT(TX_ASPHALT, cx, 0.03f, cz, 1.0f, 0.06f, 1.0f, WHITE);
-    else if (s == T_LANDFILL) { if (IsRecycleTile(x, y)) BoxT(TX_CONCRETE, cx, 0.02f, cz, 1.0f, 0.04f, 1.0f, (Color){ 215, 215, 215, 255 }); else BoxT(TX_TRASH, cx, 0.015f, cz, 1.0f, 0.03f, 1.0f, WHITE); }
-    else if (paved[y][x])    BoxT(TX_CONCRETE, cx, 0.02f, cz, 1.0f, 0.04f, 1.0f, (Color){ 215, 215, 215, 255 });
-    else                     BoxT(TX_GRASS, cx, 0.015f, cz, 1.0f, 0.03f, 1.0f, (s == T_HOUSE) ? (Color){ 235, 255, 235, 255 } : WHITE);
+    if (xray)                BoxC(cx, GROUND_TOP * 0.5f, cz, 1.0f, GROUND_TOP, 1.0f, COL_SOIL);
+    else if (s == T_PARK)    BoxT(TX_ASPHALT, cx, GROUND_TOP * 0.5f, cz, 1.0f, GROUND_TOP, 1.0f, WHITE);
+    else if (s == T_LANDFILL) { if (IsRecycleTile(x, y)) BoxT(TX_CONCRETE, cx, GROUND_TOP * 0.5f, cz, 1.0f, GROUND_TOP, 1.0f, (Color){ 215, 215, 215, 255 }); else BoxT(TX_TRASH, cx, GROUND_TOP * 0.5f, cz, 1.0f, GROUND_TOP, 1.0f, WHITE); }
+    else if (paved[y][x])    BoxT(TX_CONCRETE, cx, WALK_TOP * 0.5f, cz, 1.0f, WALK_TOP, 1.0f, (Color){ 215, 215, 215, 255 });
+    else                     BoxT(TX_GRASS, cx, GROUND_TOP * 0.5f, cz, 1.0f, GROUND_TOP, 1.0f, (s == T_HOUSE) ? (Color){ 235, 255, 235, 255 } : WHITE);
     if (layerOn[L_ROADS]) {
         Rectangle r[8];
         int n = SidewalkRects(x, y, r);
         for (int i = 0; i < n; i++)
-            BoxT(TX_CONCRETE, x + r[i].x + r[i].width / 2.0f, 0.025f, y + r[i].y + r[i].height / 2.0f,
-                 r[i].width, 0.05f, r[i].height, xray ? COL_SIDEWALK_DIM : (Color){ 255, 238, 200, 255 });
+            BoxT(TX_CONCRETE, x + r[i].x + r[i].width / 2.0f, WALK_TOP * 0.5f, y + r[i].y + r[i].height / 2.0f,
+                 r[i].width, WALK_TOP, r[i].height, xray ? COL_SIDEWALK_DIM : (Color){ 255, 238, 200, 255 });
     }
 }
 
@@ -6381,7 +6539,7 @@ static unsigned int GSceneKey(bool xray) {
 
 static void DrawStaticScene(bool xray) {
     gAlpha = 1.0f;
-    GPlane(V3(MAP_W / 2.0f, -0.03f, MAP_H / 2.0f), (Vector2){ MAP_W + 60, MAP_H + 60 }, (Color){ 58, 105, 52, 255 });
+    GPlane(V3(MAP_W / 2.0f, 0.0f, MAP_H / 2.0f), (Vector2){ MAP_W + 60, MAP_H + 60 }, (Color){ 58, 105, 52, 255 });   // the flat boundary floor
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) DrawGround3D(x, y, xray);
     if (layerOn[L_WATER]) DrawNetwork3D(-0.11f, 0.13f, COL_WATER_PIPE);     // (the sewer main is live: it can flash red)
