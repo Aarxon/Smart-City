@@ -53,6 +53,7 @@
 #define HIST        120        // graph samples (1 per second => 2 minutes)
 #define DAY_LEN     120.0f     // real seconds per simulated day
 #define SIG_CYCLE   24.0f      // traffic light cycle (seconds)
+#define MOTORWAY_SPEED 1.5f    // cars drive this much faster on a motorway
 
 #define MAX_CARS    90
 #define MAX_PEDS    64
@@ -277,6 +278,7 @@ static int   droneSorties = 0, reroutes = 0;
 static int   medCalls = 0, medSaved = 0, medLost = 0, respN = 0, transN = 0;
 static float respSum = 0.0f, transSum = 0.0f, medTimer = 8.0f, avgSpeed = 0.0f;
 static bool  monitorTile[MAP_H][MAP_W];             // smart traffic monitor masts
+static bool  motorway[MAP_H][MAP_W];                // fast road: no sidewalks, no walking, no junction control
 static float hospTimer = 0.0f;
 
 static float hist[G_COUNT][HIST];
@@ -303,6 +305,7 @@ static const float VWID[V_COUNT] = { 0.115f, 0.11f, 0.115f, 0.12f, 0.125f, 0.125
 static float Rf(void) { return GetRandomValue(0, 10000) / 10000.0f; }
 static bool InBounds(int x, int y) { return x >= 0 && x < MAP_W && y >= 0 && y < MAP_H; }
 static bool IsRoad(int x, int y) { return InBounds(x, y) && surface[y][x] == T_ROAD; }
+static bool IsStreet(int x, int y) { return IsRoad(x, y) && !motorway[y][x]; }   // a road with sidewalks (not a motorway)
 static bool ZoneFenced(int z) { return z >= Z_GATED1 && z <= Z_LANDFILL; }
 static bool IsBldg(int s) { return s == T_BUILDING || s == T_HOUSE || s == T_MALL || s == T_HOSPITAL; }
 static bool Flammable(int x, int y) {
@@ -355,21 +358,24 @@ static int RoadLine(int x, int y) {
 static int RoadNeighbours(int x, int y) {
     return IsRoad(x - 1, y) + IsRoad(x + 1, y) + IsRoad(x, y - 1) + IsRoad(x, y + 1);
 }
+static int StreetNeighbours(int x, int y) {
+    return IsStreet(x - 1, y) + IsStreet(x + 1, y) + IsStreet(x, y - 1) + IsStreet(x, y + 1);
+}
 
 // Sidewalk pieces for a non-road tile, in tile units (0..1). Used by both 2D and 3D.
 static int SidewalkRects(int x, int y, Rectangle *r) {
     // The strip is SIDEWALK_W wide and reaches ROAD_INSET into the road, which is narrowed to match.
     float w = SIDEWALK_W / (float)TILE, d = ROAD_INSET, in = SIDE_IN;
     int n = 0;
-    bool up = IsRoad(x, y - 1), down = IsRoad(x, y + 1), left = IsRoad(x - 1, y), right = IsRoad(x + 1, y);
+    bool up = IsStreet(x, y - 1), down = IsStreet(x, y + 1), left = IsStreet(x - 1, y), right = IsStreet(x + 1, y);
     if (up)    r[n++] = (Rectangle){ 0, -d, 1, w };
     if (down)  r[n++] = (Rectangle){ 0, 1 - in, 1, w };
     if (left)  r[n++] = (Rectangle){ -d, 0, w, 1 };
     if (right) r[n++] = (Rectangle){ 1 - in, 0, w, 1 };
-    if (!up && !left && IsRoad(x - 1, y - 1))    r[n++] = (Rectangle){ -d, -d, w, w };
-    if (!up && !right && IsRoad(x + 1, y - 1))   r[n++] = (Rectangle){ 1 - in, -d, w, w };
-    if (!down && !left && IsRoad(x - 1, y + 1))  r[n++] = (Rectangle){ -d, 1 - in, w, w };
-    if (!down && !right && IsRoad(x + 1, y + 1)) r[n++] = (Rectangle){ 1 - in, 1 - in, w, w };
+    if (!up && !left && IsStreet(x - 1, y - 1))    r[n++] = (Rectangle){ -d, -d, w, w };
+    if (!up && !right && IsStreet(x + 1, y - 1))   r[n++] = (Rectangle){ 1 - in, -d, w, w };
+    if (!down && !left && IsStreet(x - 1, y + 1))  r[n++] = (Rectangle){ -d, 1 - in, w, w };
+    if (!down && !right && IsStreet(x + 1, y + 1)) r[n++] = (Rectangle){ 1 - in, 1 - in, w, w };
     return n;
 }
 
@@ -1297,12 +1303,12 @@ static void BuildCommunity(int id, int x0, int y0, int x1, int y1, int laneY, in
 }
 
 // ---- The city layout: one text row per map row ------------------------------------------------
-//   '=' road     '~' river     'T' tree belt (the parkland edge, and the corners cut away from the city)
+//   '=' road     'M' motorway (fast road, no sidewalks)     '~' river     'T' tree belt (parkland edge, cut-away corners)
 //   '.' land: filled with blocks, houses, shops and offices, plus the districts placed in GenerateCity
 // Roads are straight arterials. Where two meet the junction control is worked out from the road shape.
 static const char *LAYOUT[MAP_H] = {
-    "TTTTTTTTTTTTTTTTTTTTTT=TTTTTTTTTTTTT",
-    "T....=.......=........=........TTTTT",
+    "MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM",
+    "TTTTT=TTTTTTT=TTTTTTTT=TTTTTTTTTTTTT",
     "T....=.......=........=......=.TTTTT",
     "T.================================TT",
     "T....=.......=........=......=.TTTTT",
@@ -1337,7 +1343,7 @@ static void GenerateCity(void) {
     memset(gateTile, 0, sizeof(gateTile)); memset(drive, 0, sizeof(drive)); memset(drvCol, 0, sizeof(drvCol));
     memset(lot, 0, sizeof(lot));       memset(lotCol, 0, sizeof(lotCol)); memset(ctrl, 0, sizeof(ctrl));
     memset(crossT, 0, sizeof(crossT)); memset(nodeOcc, 0, sizeof(nodeOcc)); memset(crossBusy, 0, sizeof(crossBusy));
-    memset(pedNode, 0, sizeof(pedNode));
+    memset(pedNode, 0, sizeof(pedNode));   memset(motorway, 0, sizeof(motorway));
 
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) {
@@ -1351,7 +1357,8 @@ static void GenerateCity(void) {
         int n = (int)strlen(LAYOUT[y]);
         for (int x = 0; x < MAP_W; x++) {
             char c = x < n ? LAYOUT[y][x] : '.';
-            surface[y][x] = (c == '=') ? T_ROAD : (c == '~') ? T_RIVER : (c == 'T') ? T_TREE : T_GRASS;
+            surface[y][x] = (c == '=' || c == 'M') ? T_ROAD : (c == '~') ? T_RIVER : (c == 'T') ? T_TREE : T_GRASS;
+            motorway[y][x] = (c == 'M');
         }
     }
 
@@ -1438,7 +1445,7 @@ static void GenerateCity(void) {
     static const int roundabouts[2][2] = { { 13, 3 }, { 29, 15 } };
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) {
-            if (!IsRoad(x, y)) continue;
+            if (!IsStreet(x, y)) continue;
             int n = RoadNeighbours(x, y);
             if (n < 3) continue;
             unsigned char c = (n >= 4) ? C_SIGNAL : C_STOP;
@@ -1457,7 +1464,7 @@ static void GenerateCity(void) {
     // ---- Sidewalk graph + pedestrian crossings ----------------------------------
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++)
-            pedNode[y][x] = (surface[y][x] != T_ROAD) && surface[y][x] != T_RIVER && RoadNeighbours(x, y) > 0;
+            pedNode[y][x] = (surface[y][x] != T_ROAD) && surface[y][x] != T_RIVER && StreetNeighbours(x, y) > 0;
 
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) {
@@ -1465,7 +1472,7 @@ static void GenerateCity(void) {
             int ji = y * MAP_W + x;
             for (int d = 0; d < 4; d++) {
                 int lx = x + DX[d], ly = y + DY[d];
-                if (!IsRoad(lx, ly) || RoadNeighbours(lx, ly) != 2 || RoadLine(lx, ly) == 0) continue;
+                if (!IsStreet(lx, ly) || RoadNeighbours(lx, ly) != 2 || RoadLine(lx, ly) == 0) continue;
                 int ct = (d < 2) ? 1 : 2;
                 bool ok = (ct == 1) ? (PedSide(lx - 1, ly) && PedSide(lx + 1, ly)) : (PedSide(lx, ly - 1) && PedSide(lx, ly + 1));
                 if (ok) { crossT[ly][lx] = (unsigned char)ct; crossI[ly][lx] = ji; }
@@ -1474,7 +1481,7 @@ static void GenerateCity(void) {
     // Mid-block crossings: about one straight block in eleven, kept clear of junctions
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) {
-            if (!IsRoad(x, y) || RoadNeighbours(x, y) != 2 || RoadLine(x, y) == 0 || crossT[y][x]) continue;
+            if (!IsStreet(x, y) || RoadNeighbours(x, y) != 2 || RoadLine(x, y) == 0 || crossT[y][x]) continue;
             if (((x * 7 + y * 3) % 11) != 0) continue;
             bool near = false;
             for (int dy = -2; dy <= 2; dy++)
@@ -1506,7 +1513,7 @@ static void GenerateCity(void) {
             if (!IsRoad(x, y) || ctrl[y][x] == C_NONE) continue;
             for (int d = 0; d < 4; d++) {
                 int mx = x + 2 * DX[d], my = y + 2 * DY[d];
-                if (IsRoad(mx, my) && RoadNeighbours(mx, my) == 2 && RoadLine(mx, my) != 0 && !crossT[my][mx]) monitorTile[my][mx] = true;
+                if (IsStreet(mx, my) && RoadNeighbours(mx, my) == 2 && RoadLine(mx, my) != 0 && !crossT[my][mx]) monitorTile[my][mx] = true;
             }
         }
 
@@ -1815,6 +1822,19 @@ static bool EntryBlocked(const Car *c, int dir) {
     return false;
 }
 
+// joining a motorway from a slip road: is a car on the motorway close to the point where it joins?
+static bool MergeBlocked(const Car *c, int dir) {
+    float mx = c->gx + DX[dir] + 0.5f, my = c->gy + DY[dir] + 0.5f;
+    for (int j = 0; j < MAX_CARS; j++) {
+        const Car *o = &cars[j];
+        if (o == c || !o->active || o->arcing) continue;
+        if (!motorway[o->gy][o->gx] && !motorway[o->ty][o->tx]) continue;
+        float dx = o->x - mx, dy = o->y - my;
+        if (dx * dx + dy * dy < 2.25f) return true;      // motorway cars cover about 2.6 tiles a second
+    }
+    return false;
+}
+
 // would a car at (x,y,yaw) newly overlap another vehicle? (it may already be touching one, then it may move on to separate)
 static bool StepHitsVehicle(const Car *c, float x, float y, float yaw) {
     float L = VLEN[c->type], W = VWID[c->type];
@@ -1892,6 +1912,7 @@ static void UpdateCars(float dt) {
         float base = (c->type == V_BIKE) ? 1.15f : (c->type == V_TRUCK ? 1.7f : 2.0f);
         base *= c->speedMul;
         if (c->speeder) base *= 1.75f;
+        if (motorway[c->gy][c->gx]) base *= MOTORWAY_SPEED;
         if (c->fleeing) base = 4.5f;
         float v = base;
         c->braking = false;
@@ -1957,7 +1978,7 @@ static void UpdateCars(float dt) {
             else if (free < v * dt) v = free / dt;          // brake early enough to stop exactly at the gap
             if (v == 0.0f) { jammed++; stopWhy[i] = (unsigned char)(c->braking && why ? why : 5); } else stopWhy[i] = 0;
 
-            if (c->speeder && v > 2.9f && !c->wanted && c->lostT <= 0.0f && !c->fleeing) { Violation(c, 2); c->lostT = 8.0f; }
+            if (c->speeder && v > (motorway[c->gy][c->gx] ? 2.9f * MOTORWAY_SPEED : 2.9f) && !c->wanted && c->lostT <= 0.0f && !c->fleeing) { Violation(c, 2); c->lostT = 8.0f; }
 
             // last check before stepping: never move onto another vehicle, whatever lane or junction it is in
             if (v > 0.0f && c->t + dt * v < 1.0f && ctrl[c->gy][c->gx] != C_ROUNDABOUT && ctrl[c->ty][c->tx] != C_ROUNDABOUT) {
@@ -1997,6 +2018,7 @@ static void UpdateCars(float dt) {
                     else choice = (no > 0) ? opts[GetRandomValue(0, no - 1)] : valid[0];
                 }
                 if (choice >= 0 && ctrl[c->gy][c->gx] != C_ROUNDABOUT && EntryBlocked(c, choice)) { choice = -1; c->wait += dt; c->braking = true; }   // wait at the junction until the lane is clear
+                if (choice >= 0 && motorway[c->gy + DY[choice]][c->gx + DX[choice]] && !motorway[c->gy][c->gx] && MergeBlocked(c, choice)) { choice = -1; c->wait += dt; c->braking = true; }   // join the motorway only when the gap is clear
                 if (choice >= 0) {
                     if (ctrl[c->gy][c->gx] == C_ROUNDABOUT) {
                         float fromA = atan2f((float)-DY[c->dir], (float)-DX[c->dir]);
@@ -3330,7 +3352,7 @@ static bool FpOnRoad(float px, float pz) {
     if (px >= MAP_W) return (smartCity && ty == FARM_ROAD_Y);
     if (!InBounds(tx, ty)) return false;
     int s = surface[ty][tx];
-    return s == T_ROAD || s == T_PARK || paved[ty][tx];
+    return (s == T_ROAD && !motorway[ty][tx]) || s == T_PARK || paved[ty][tx];
 }
 
 // Is this ground point inside a building, tree, fence or other solid?
@@ -4037,7 +4059,7 @@ static Color NoiseColorAt(int x, int y) {
 #define RES_POP_HOUSE      6.0f    // residents per house
 
 static bool WalkTile(int x, int y) {
-    return InBounds(x, y) && (surface[y][x] == T_ROAD || pedNode[y][x] || surface[y][x] == T_PARK);
+    return InBounds(x, y) && !motorway[y][x] && (surface[y][x] == T_ROAD || pedNode[y][x] || surface[y][x] == T_PARK);
 }
 
 static bool ServiceTile(int svc, int x, int y) {
@@ -4778,7 +4800,18 @@ static void DrawGround2D(int x, int y, bool xray) {
         DrawRectangle(px, py, TILE, TILE, RoadColorAt(x, y, xray));
         int ln = RoadLine(x, y);
         Color lc = xray ? (Color){ 150, 150, 150, 255 } : COL_LINE;
-        if (ln == 1) DrawRectangle(px + TILE / 4, py + TILE / 2 - LINE_THICK / 2, TILE / 2, LINE_THICK, lc);
+        if (motorway[y][x]) {            // motorway: solid central barrier and an edge line either side, no dashes
+            Color bar = xray ? COL_LABEL : (Color){ 150, 150, 158, 255 };
+            if (ln == 1) {
+                DrawRectangle(px, py + TILE / 2 - 3, TILE, 6, bar);
+                DrawRectangle(px, py + 1, TILE, 1, lc); DrawRectangle(px, py + TILE - 2, TILE, 1, lc);
+            } else if (ln == 2) {
+                DrawRectangle(px + TILE / 2 - 3, py, 6, TILE, bar);
+                DrawRectangle(px + 1, py, 1, TILE, lc); DrawRectangle(px + TILE - 2, py, 1, TILE, lc);
+            }
+            if (x == 3 && y == 0) DrawText("M1", px + 6, py + 12, 12, Fade(YELLOW, 0.9f));
+        }
+        else if (ln == 1) DrawRectangle(px + TILE / 4, py + TILE / 2 - LINE_THICK / 2, TILE / 2, LINE_THICK, lc);
         else if (ln == 2) DrawRectangle(px + TILE / 2 - LINE_THICK / 2, py + TILE / 4, LINE_THICK, TILE / 2, lc);
         if (crossT[y][x]) DrawZebra2D(x, y);
         if (ctrl[y][x]) DrawJunction2D(x, y, xray);
@@ -6854,12 +6887,18 @@ static void DrawGround3D(int x, int y, bool xray) {
     if (s == T_ROAD) {
         if (!layerOn[L_ROADS]) return;
         Color rt = xray ? (Color){ 150, 150, 150, 255 } : WHITE;
-        float rx0 = (InBounds(x - 1, y) && !IsRoad(x - 1, y)) ? ROAD_INSET : 0.0f, rx1 = (InBounds(x + 1, y) && !IsRoad(x + 1, y)) ? 1.0f - ROAD_INSET : 1.0f;
-        float rz0 = (InBounds(x, y - 1) && !IsRoad(x, y - 1)) ? ROAD_INSET : 0.0f, rz1 = (InBounds(x, y + 1) && !IsRoad(x, y + 1)) ? 1.0f - ROAD_INSET : 1.0f;
+        bool mw = motorway[y][x];
+        float rx0 = (!mw && InBounds(x - 1, y) && !IsRoad(x - 1, y)) ? ROAD_INSET : 0.0f, rx1 = (!mw && InBounds(x + 1, y) && !IsRoad(x + 1, y)) ? 1.0f - ROAD_INSET : 1.0f;
+        float rz0 = (!mw && InBounds(x, y - 1) && !IsRoad(x, y - 1)) ? ROAD_INSET : 0.0f, rz1 = (!mw && InBounds(x, y + 1) && !IsRoad(x, y + 1)) ? 1.0f - ROAD_INSET : 1.0f;
         BoxT(TX_ASPHALT, x + (rx0 + rx1) * 0.5f, GROUND_TOP * 0.5f, y + (rz0 + rz1) * 0.5f, rx1 - rx0, GROUND_TOP, rz1 - rz0, rt);
         int ln = RoadLine(x, y);
         Color lc = xray ? (Color){ 150, 150, 150, 255 } : COL_LINE;
-        if (ln == 1) BoxC(cx, GROUND_TOP + 0.006f, cz, 0.5f, 0.012f, 0.045f, lc);
+        if (mw) {   // motorway: a raised concrete central barrier, no dashes
+            Color bar = xray ? COL_LABEL : (Color){ 150, 150, 158, 255 };
+            if (ln == 1) BoxC(cx, GROUND_TOP + 0.03f, cz, 1.0f, 0.06f, 0.10f, bar);
+            else if (ln == 2) BoxC(cx, GROUND_TOP + 0.03f, cz, 0.10f, 0.06f, 1.0f, bar);
+        }
+        else if (ln == 1) BoxC(cx, GROUND_TOP + 0.006f, cz, 0.5f, 0.012f, 0.045f, lc);
         else if (ln == 2) BoxC(cx, GROUND_TOP + 0.006f, cz, 0.045f, 0.012f, 0.5f, lc);
         DrawRoadMarkings3D(x, y);
         return;
