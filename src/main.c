@@ -487,8 +487,13 @@ static DropMark drops[N_DROPS];
 // ---- green roofs ------------------------------------------------------------------------
 static int   greenRoofs = 0;
 
+// ---- city budget (KPI): running balance and today's rates, in k$ --------------------------------
+// Reported only. Nothing is blocked or switched off when the balance is negative.
+static float budBalanceK = 0.0f;        // net since the city was generated
+static float budIncomeK = 0.0f, budSpendK = 0.0f;   // income and spending, k$ per simulated day
+
 // ---- digital-twin recorder: time-weighted averages kept separately for each mode ----------------
-enum { TW_AQI = 0, TW_FOSSIL, TW_CO2, TW_DEMAND, TW_LIGHT, TW_SPEED, TW_STOP, TW_LEAK, TW_COUNT };
+enum { TW_AQI = 0, TW_FOSSIL, TW_CO2, TW_DEMAND, TW_LIGHT, TW_SPEED, TW_STOP, TW_LEAK, TW_BUDGET, TW_COUNT };
 static double twSum[2][TW_COUNT], twTime[2];
 static double twNight[2];
 static float demandBaseKW = 1.0f;
@@ -2907,6 +2912,7 @@ static void InitPlus(void) {
     memset(twRespSum, 0, sizeof(twRespSum)); memset(twRespN, 0, sizeof(twRespN));
     memset(twTransSum, 0, sizeof(twTransSum)); memset(twTransN, 0, sizeof(twTransN));
     memset(twLost, 0, sizeof(twLost)); memset(twRecycle, 0, sizeof(twRecycle)); memset(twLandfill, 0, sizeof(twLandfill));
+    budBalanceK = 0.0f; budIncomeK = 0.0f; budSpendK = 0.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -3764,6 +3770,53 @@ static void UpdateFp(float dt) {
 }
 
 // ---------------------------------------------------------------------------
+// City budget (KPI).  Income comes in from taxes, business rates and electricity sold;
+// spending goes out on fuel, services, road upkeep and (smart city only) the smart systems.
+// Units are k$ (thousands of dollars) per simulated day.  The balance is reported on the
+// stats panel and the digital-twin dashboard, and is never used to stop anything.
+// ---------------------------------------------------------------------------
+#define BUD_TAX_PER_RESIDENT   0.020f    // council tax per resident per day
+#define BUD_RATE_PER_BUSINESS  0.50f     // business rates per shop or factory per day
+#define BUD_TARIFF_PER_KW_DAY  0.0048f   // electricity sold: 24 h x $0.20/kWh, per kW of demand
+#define BUD_FUEL_PER_KW_DAY    0.00144f  // fuel burned at the power plant: 24 h x $0.06/kWh
+#define BUD_STATION_PER_DAY    4.0f      // running cost of each fire, police and hospital station
+#define BUD_ROAD_PER_TILE      0.02f     // road and footpath upkeep per tile
+#define BUD_LAMP_PER_DAY       0.05f     // smart street lamp: maintenance and data link
+#define BUD_BIN_PER_DAY        0.03f     // smart bin: fill sensor and data link
+#define BUD_MONITOR_PER_DAY    0.20f     // smart traffic monitor mast
+
+// Income and spending right now (k$ per simulated day)
+static void BudgetRates(float *income, float *spend) {
+    int shops = 0, roads = 0, monitors = 0;
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) {
+            if (surface[y][x] == T_ROAD) roads++;
+            if (surface[y][x] == T_BUILDING && (bType[y][x] == B_COM || bType[y][x] == B_IND)) shops++;
+            if (monitorTile[y][x]) monitors++;
+        }
+
+    *income = st.population * BUD_TAX_PER_RESIDENT
+            + shops * BUD_RATE_PER_BUSINESS
+            + st.energyDemand * BUD_TARIFF_PER_KW_DAY;
+
+    float fuelKW = smartCity ? gridImportKW : st.energyDemand;   // smart city burns only the backup import
+    *spend = fuelKW * BUD_FUEL_PER_KW_DAY
+           + (nFire + nPolice + nHosp) * BUD_STATION_PER_DAY
+           + roads * BUD_ROAD_PER_TILE;
+    if (smartCity)
+        *spend += nLamps * BUD_LAMP_PER_DAY + nBins * BUD_BIN_PER_DAY + monitors * BUD_MONITOR_PER_DAY;
+}
+
+static void UpdateBudget(float dt) {
+    float inc, sp;
+    BudgetRates(&inc, &sp);
+    budIncomeK = inc; budSpendK = sp;
+    float net = inc - sp;
+    budBalanceK += net * dt / DAY_LEN;                  // dt and DAY_LEN are both sim seconds: dt / DAY_LEN = share of a day
+    twSum[smartCity ? 1 : 0][TW_BUDGET] += net * dt;    // time-weighted average net, kept per mode
+}
+
+// ---------------------------------------------------------------------------
 // Heat / pollution maps, statistics, simulation driver
 // ---------------------------------------------------------------------------
 static void UpdateMaps(void) {
@@ -3967,6 +4020,7 @@ static void UpdateSim(float dt) {
     UpdateMedical(dt);
     UpdateWind(dt);
     UpdatePlus(dt);
+    UpdateBudget(dt);
     UpdateFire(dt);
     EmitChimneys(dt);
     UpdateParticles(dt);
@@ -6716,6 +6770,7 @@ static void DrawDashboard(void) {
     double l1 = (twLandfill[1] + twRecycle[1]) > 0.001 ? 100.0 * twLandfill[1] / (twLandfill[1] + twRecycle[1]) : NAN;
     TwRow(&y, x, "Waste sent to landfill (%)",   l0, l1, "%.0f", true);
     TwRow(&y, x, "Patients lost (count)",        twTime[0] > 8 ? twLost[0] : NAN, twTime[1] > 8 ? twLost[1] : NAN, "%.0f", true);
+    TwRow(&y, x, "City budget net (k$/day)",     TwAvg(0, TW_BUDGET), TwAvg(1, TW_BUDGET), "%.2f", false);
     y += 2;
     snprintf(b, sizeof(b), "recorded: normal %.2f days   smart %.2f days  (1 day = %d s)", twTime[0] / DAY_LEN, twTime[1] / DAY_LEN, (int)DAY_LEN);
     DrawText(b, x, y, 10, GRAY); y += 12;
@@ -6874,6 +6929,7 @@ static void DrawLeftPanel(void) {
     StatRow("Police chases", TextFormat("%d caught / %d escaped", caught, escaped), SKYBLUE);
     StatRow("Security index", TextFormat("%.0f%%", st.security), LIGHTGRAY);
     StatRow("Medical", TextFormat("%d calls / %d saved / %d lost", medCalls, medSaved, medLost), (Color){ 255, 120, 130, 255 });
+    StatRow("City budget", TextFormat("%+.1f k$  (%+.2f k$/day)", budBalanceK, budIncomeK - budSpendK), budBalanceK >= 0.0f ? (Color){ 120, 230, 140, 255 } : (Color){ 245, 110, 90, 255 });
     if (smartCity) StatRow("Recycling", TextFormat("%.0f%% diverted  (%.0f t)", recycledT + wasteT > 0 ? 100.0f * recycledT / (recycledT + wasteT) : 64.0f, recycledT), (Color){ 90, 220, 140, 255 });
     else           StatRow("Power source", "fuel-burning plant", (Color){ 200, 160, 110, 255 });
 
