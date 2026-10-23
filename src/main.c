@@ -70,7 +70,7 @@
 #define SEWER_CAP   8500.0f    // sewer capacity (litres/min)
 
 #define LAYER_Y0    84
-#define LAYER_H     16
+#define LAYER_H     15
 #define ROW_H       12
 
 typedef enum {
@@ -492,8 +492,12 @@ static int   greenRoofs = 0;
 static float budBalanceK = 0.0f;        // net since the city was generated
 static float budIncomeK = 0.0f, budSpendK = 0.0f;   // income and spending, k$ per simulated day
 
+// ---- citizen happiness (KPI, 0-100): reported only, nothing in the simulation reads it back ----
+static float happyNow = 0.0f;           // current score
+static int   happyLow = 0;              // index of the weakest measure (HAP_NAME in p6g_happy.c)
+
 // ---- digital-twin recorder: time-weighted averages kept separately for each mode ----------------
-enum { TW_AQI = 0, TW_FOSSIL, TW_CO2, TW_DEMAND, TW_LIGHT, TW_SPEED, TW_STOP, TW_LEAK, TW_BUDGET, TW_COUNT };
+enum { TW_AQI = 0, TW_FOSSIL, TW_CO2, TW_DEMAND, TW_LIGHT, TW_SPEED, TW_STOP, TW_LEAK, TW_BUDGET, TW_HAPPY, TW_COUNT };
 static double twSum[2][TW_COUNT], twTime[2];
 static double twNight[2];
 static float demandBaseKW = 1.0f;
@@ -3817,6 +3821,41 @@ static void UpdateBudget(float dt) {
 }
 
 // ---------------------------------------------------------------------------
+// Citizen happiness (KPI, 0-100).  A weighted average of seven measures the simulation already
+// tracks.  It is reported on the stats panel and the digital-twin dashboard; the simulation never
+// reads it back, so it changes nothing by itself.  Each measure is scored 0-100 (100 = best).
+// ---------------------------------------------------------------------------
+#define HAP_N 7
+static const char  *HAP_NAME[HAP_N] = { "air", "green", "traffic", "safety", "health", "bins", "utilities" };
+static const float  HAP_W[HAP_N]    = { 0.20f, 0.15f, 0.15f, 0.15f, 0.10f, 0.10f, 0.15f };   // sums to 1.00
+
+// 100 while the supply covers demand; loses 2 points for every 1% that demand is above supply
+static float ScoreOverPct(float pct) { return Clamp(100.0f - 2.0f * fmaxf(0.0f, pct - 100.0f), 0.0f, 100.0f); }
+
+static void UpdateHappiness(float dt) {
+    int full = 0;
+    for (int i = 0; i < nBins; i++) if (bins[i].fill >= 100.0f) full++;
+    float stopped = st.vehicles ? 100.0f * st.jammed / (float)st.vehicles : 0.0f;
+
+    float part[HAP_N];
+    part[0] = 100.0f - (st.aqi - 10.0f) * 0.5f;                              // air: AQI 10 scores 100, AQI 210 scores 0
+    part[1] = st.green / 25.0f * 100.0f;                                     // green: 25% of the map scores 100
+    part[2] = 100.0f - stopped;                                              // traffic: share of vehicles not stopped
+    part[3] = st.security;                                                   // safety: the security index
+    part[4] = medCalls ? 100.0f * medSaved / (float)medCalls : 100.0f;      // health: share of medical calls saved
+    part[5] = nBins ? 100.0f * (1.0f - full / (float)nBins) : 100.0f;       // bins: share not overflowing
+    part[6] = 0.5f * (ScoreOverPct(st.energyPct) + ScoreOverPct(st.waterPct)); // utilities: power and water
+
+    happyNow = 0.0f; happyLow = 0;
+    for (int i = 0; i < HAP_N; i++) {
+        part[i] = Clamp(part[i], 0.0f, 100.0f);
+        happyNow += HAP_W[i] * part[i];
+        if (part[i] < part[happyLow]) happyLow = i;
+    }
+    twSum[smartCity ? 1 : 0][TW_HAPPY] += happyNow * dt;     // time-weighted average, kept per mode
+}
+
+// ---------------------------------------------------------------------------
 // Heat / pollution maps, statistics, simulation driver
 // ---------------------------------------------------------------------------
 static void UpdateMaps(void) {
@@ -4021,6 +4060,7 @@ static void UpdateSim(float dt) {
     UpdateWind(dt);
     UpdatePlus(dt);
     UpdateBudget(dt);
+    UpdateHappiness(dt);
     UpdateFire(dt);
     EmitChimneys(dt);
     UpdateParticles(dt);
@@ -6771,6 +6811,7 @@ static void DrawDashboard(void) {
     TwRow(&y, x, "Waste sent to landfill (%)",   l0, l1, "%.0f", true);
     TwRow(&y, x, "Patients lost (count)",        twTime[0] > 8 ? twLost[0] : NAN, twTime[1] > 8 ? twLost[1] : NAN, "%.0f", true);
     TwRow(&y, x, "City budget net (k$/day)",     TwAvg(0, TW_BUDGET), TwAvg(1, TW_BUDGET), "%.2f", false);
+    TwRow(&y, x, "Citizen happiness (0-100)",    TwAvg(0, TW_HAPPY),  TwAvg(1, TW_HAPPY),  "%.0f", false);
     y += 2;
     snprintf(b, sizeof(b), "recorded: normal %.2f days   smart %.2f days  (1 day = %d s)", twTime[0] / DAY_LEN, twTime[1] / DAY_LEN, (int)DAY_LEN);
     DrawText(b, x, y, 10, GRAY); y += 12;
@@ -6908,7 +6949,7 @@ static void DrawLeftPanel(void) {
     }
 
     DrawText("CITY STATISTICS", 12, LAYER_Y0 + L_COUNT * LAYER_H + 2, 10, GRAY);
-    uiY = LAYER_Y0 + L_COUNT * LAYER_H + 15;
+    uiY = LAYER_Y0 + L_COUNT * LAYER_H + 13;
     int mins = (int)((st.hour - (int)st.hour) * 60.0f);
     StatRow("Time", TextFormat("Day %d  %02d:%02d  x%.1f%s", st.day, (int)st.hour, mins, simSpeed, paused ? " PAUSED" : ""), RAYWHITE);
     StatRow("Population", TextFormat("%d", st.population), GREEN);
@@ -6930,10 +6971,10 @@ static void DrawLeftPanel(void) {
     StatRow("Security index", TextFormat("%.0f%%", st.security), LIGHTGRAY);
     StatRow("Medical", TextFormat("%d calls / %d saved / %d lost", medCalls, medSaved, medLost), (Color){ 255, 120, 130, 255 });
     StatRow("City budget", TextFormat("%+.1f k$  (%+.2f k$/day)", budBalanceK, budIncomeK - budSpendK), budBalanceK >= 0.0f ? (Color){ 120, 230, 140, 255 } : (Color){ 245, 110, 90, 255 });
+    StatRow("Happiness", TextFormat("%.0f / 100  (low: %s)", happyNow, HAP_NAME[happyLow]), happyNow >= 70.0f ? (Color){ 120, 230, 140, 255 } : happyNow >= 40.0f ? (Color){ 245, 215, 120, 255 } : (Color){ 245, 110, 90, 255 });
     if (smartCity) StatRow("Recycling", TextFormat("%.0f%% diverted  (%.0f t)", recycledT + wasteT > 0 ? 100.0f * recycledT / (recycledT + wasteT) : 64.0f, recycledT), (Color){ 90, 220, 140, 255 });
     else           StatRow("Power source", "fuel-burning plant", (Color){ 200, 160, 110, 255 });
 
-    uiY += 3;
     DrawText("ALERTS", 12, uiY, 10, GRAY);
     uiY += 12;
     int n = 0, pending = 0;
