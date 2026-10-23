@@ -32,8 +32,8 @@
 // Configuration
 // ---------------------------------------------------------------------------
 #define TILE        36
-#define MAP_W       24
-#define MAP_H       16
+#define MAP_W       36
+#define MAP_H       26
 #define PANEL_W     250
 #define VIEW_W      (MAP_W * TILE)
 #define VIEW_H      (MAP_H * TILE)
@@ -76,7 +76,8 @@
 typedef enum {
     T_GRASS = 0, T_ROAD, T_BUILDING, T_TREE, T_RUIN,
     T_FIRE_STN, T_POLICE_STN, T_POWER, T_WATER,
-    T_HOUSE, T_MALL, T_PARK, T_LANDFILL, T_HOSPITAL
+    T_HOUSE, T_MALL, T_PARK, T_LANDFILL, T_HOSPITAL,
+    T_RIVER
 } TileType;
 
 enum { B_RES = 0, B_COM, B_IND };
@@ -185,6 +186,7 @@ static const Color COL_POLICE_CAR  = {  60, 110, 235, 255 };
 static const Color COL_CIVILIAN    = { 240, 215, 170, 255 };
 static const Color COL_CRIMINAL    = { 190,  50, 190, 255 };
 static const Color COL_LABEL       = { 170, 175, 185, 255 };
+static const Color COL_RIVER       = {  58, 120, 180, 255 };
 
 static const Color COL_BTYPE[3] = {
     { 185, 120,  98, 255 },   // residential
@@ -407,11 +409,11 @@ static int SigState(int x, int y, int axis, float *redLeft) {
 #define N_FLOOD       6
 #define N_STOPS       6
 #define N_DROPS       8
-#define DEPOT_X       18         // refuse depot (road beside the landfill gate)
+#define DEPOT_X       29         // refuse depot (road beside the landfill gate)
 #define DEPOT_Y       11
-#define HUB_X         15         // drone fulfilment hub (loading yard)
+#define HUB_X         25         // drone fulfilment hub (loading yard)
 #define HUB_Y         11
-#define HEATPLANT_X   14         // district-heating heat exchanger (loading yard)
+#define HEATPLANT_X   24         // district-heating heat exchanger (loading yard)
 #define HEATPLANT_Y   11
 #define EV_KWS_EACH   1500.0f    // V2G energy pool per parked EV (kW-seconds, same scale as the battery bank)
 #define EV_KW_EACH    7.0f       // charge / discharge power per parked EV
@@ -446,7 +448,7 @@ static float leakTimer = 18.0f, leakLpm = 0.0f, leakLostKL = 0.0f, leakAgeSum = 
 static int   leaksTotal = 0, leaksFixed = 0;
 static float rainTankKL = 25.0f, harvestLpm = 0.0f, harvestedKL = 0.0f, runoffK = 1.0f;
 static float retentionKL = 0.0f, drainOpen = 0.0f;
-static const int FLOOD_POS[N_FLOOD][2] = { {2,3}, {8,9}, {16,13}, {4,12}, {18,7}, {11,15} };
+static const int FLOOD_POS[N_FLOOD][2] = { {2,3}, {9,9}, {20,15}, {4,12}, {18,9}, {27,15} };
 static int   floodState[N_FLOOD];        // 0 dry, 1 warning (gates opening), 2 flooding
 
 // ---- emergency-vehicle signal pre-emption -----------------------------------------
@@ -454,7 +456,7 @@ static unsigned char sigPre[MAP_H][MAP_W];   // 0 none, 1 = N-S wanted green, 2 
 static int   preemptWins = 0, redRuns = 0, preemptCalls = 0;
 
 // ---- air-quality sensor network ----------------------------------------------------
-static const int   AQ_POS[N_AQ][2] = { {6,3}, {11,5}, {20,3}, {4,12}, {13,13}, {21,13} };
+static const int   AQ_POS[N_AQ][2] = { {7,2}, {17,6}, {9,12}, {3,6}, {27,11}, {31,12} };
 static const char *AQ_NAME[N_AQ] = { "Hospital Qtr", "Downtown", "Mall District", "Gated Homes", "Industrial", "Recycling" };
 static float aqLevel[N_AQ];
 static int   aqWorst = 0;
@@ -462,22 +464,22 @@ static int   aqWorst = 0;
 // ---- parking guidance ---------------------------------------------------------------
 static int   parkFree = 0, parkTotal = 0;
 static float parkSearch = 0.0f;
-static const int PSIGN[2][2] = { {19,8}, {23,8} };
+static const int PSIGN[2][2] = { {11,8}, {12,8} };
 
 // ---- district heating -------------------------------------------------------------
 #define N_DH 3
 static const float DH_SEG[N_DH][4] = {          // x0, y0, x1, y1 in tile units (run along the sidewalks)
-    { 17.9f, 10.04f, 0.2f, 10.04f },
-    { 10.97f, 10.04f, 10.97f, 4.06f },
-    { 10.97f, 8.97f, 17.9f, 8.97f }
+    { 28.0f, 10.04f, 0.2f, 10.04f },
+    { 12.97f, 10.04f, 12.97f, 4.06f },
+    { 12.97f, 8.97f, 22.9f, 8.97f }
 };
 static bool  dhServed[MAP_H][MAP_W];
 static int   dhBuildings = 0;
 static float wasteHeatKW = 0.0f, dhKW = 0.0f, heatDemandKW = 0.0f, heatCover = 0.0f;
 
 // ---- autonomous shuttles -------------------------------------------------------------
-static const int SH_WP[4][2] = { {18,3}, {18,9}, {4,9}, {4,3} };
-static const int SH_STOP[N_STOPS][2] = { {7,3}, {14,3}, {18,5}, {14,9}, {7,9}, {4,7} };
+static const int SH_WP[4][2] = { {5,3}, {22,3}, {22,9}, {5,9} };
+static const int SH_STOP[N_STOPS][2] = { {7,3}, {17,3}, {22,6}, {17,9}, {7,9}, {5,6} };
 static int   shuttleBoard = 0, shuttleStops = 0, shuttlePax = 0, modalCars = 0;
 
 // ---- delivery drones -----------------------------------------------------------------
@@ -506,8 +508,11 @@ static float evShare = 0.0f;                                                    
 static float noiseMap[MAP_H][MAP_W];                                                     // dB at each tile
 static float noiseAvg = 0.0f, noiseLoudPct = 0.0f;
 
+// ---- 15-minute city (KPI): percent of residents with each service within a 15-minute walk ----
+static float access15All = 0.0f, access15Shop = 0.0f, access15Hosp = 0.0f, access15Park = 0.0f;
+
 // ---- digital-twin recorder: time-weighted averages kept separately for each mode ----------------
-enum { TW_AQI = 0, TW_FOSSIL, TW_CO2, TW_DEMAND, TW_LIGHT, TW_SPEED, TW_STOP, TW_LEAK, TW_BUDGET, TW_HAPPY, TW_EMPLOY, TW_CARBON_PP, TW_NOISE, TW_POP, TW_COUNT };
+enum { TW_AQI = 0, TW_FOSSIL, TW_CO2, TW_DEMAND, TW_LIGHT, TW_SPEED, TW_STOP, TW_LEAK, TW_BUDGET, TW_HAPPY, TW_EMPLOY, TW_CARBON_PP, TW_NOISE, TW_POP, TW_ACCESS15, TW_COUNT };
 static double twSum[2][TW_COUNT], twTime[2];
 static double twNight[2];
 static float demandBaseKW = 1.0f;
@@ -1291,16 +1296,41 @@ static void BuildCommunity(int id, int x0, int y0, int x1, int y1, int laneY, in
     }
 }
 
+// ---- The city layout: one text row per map row ------------------------------------------------
+//   '=' road     '~' river     'T' tree belt (the parkland edge, and the corners cut away from the city)
+//   '.' land: filled with blocks, houses, shops and offices, plus the districts placed in GenerateCity
+// Roads are straight arterials. Where two meet the junction control is worked out from the road shape.
+static const char *LAYOUT[MAP_H] = {
+    "TTTTTTTTTTTTTTTTTTTTTT=TTTTTTTTTTTTT",
+    "T....=.......=........=........TTTTT",
+    "T....=.......=........=......=.TTTTT",
+    "T.================================TT",
+    "T....=.......=........=......=.TTTTT",
+    "T....=.......=........=......=.TTTTT",
+    "T....=.......=........=......=......",
+    "T....=.......=........=......=......",
+    "T....=.......=........=......=......",
+    "T===================================",
+    "T....=.......=........=......=......",
+    "T....=.......=........=......=......",
+    "T....=.......=........=......=......",
+    "T....=.......=........=......=......",
+    "T....=.......=........=......=......",
+    "T..============================.....",
+    "T....=.......=........=......=......",
+    "T....=.......=........=......=......",
+    "T....=.......=........=......=......",
+    "TTTT.=.......=........=.............",
+    "TTTT.=============================..",
+    "TTTT.=.......=........=.............",
+    "TTTT......................~~~~~~~~~~",
+    "TTTT......................~~~~~~~~~~",
+    "TTTTTTTTTTTTTT~~~~~~~~~~~~TTTTTTTTTT",
+    "~~~~~~~~~~~~~~~~~~~~~~~~~~TTTTTTTTTT",
+};
+
 static void GenerateCity(void) {
     gSceneGen++;
-    static const int roadRows[3] = { 3, 9, 13 };
-    static const int roadCols[3] = { 4, 11, 18 };
-    // junction control: [row][col]
-    static const unsigned char junction[3][3] = {
-        { C_SIGNAL, C_ROUNDABOUT, C_SIGNAL },
-        { C_SIGNAL, C_SIGNAL,     C_SIGNAL },
-        { C_STOP,   C_STOP,       C_ROUNDABOUT }
-    };
 
     memset(bType, 0, sizeof(bType));   memset(zone, 0, sizeof(zone));    memset(faceDir, 0, sizeof(faceDir));
     memset(vr, 0, sizeof(vr));         memset(deco, 0, sizeof(deco));    memset(paved, 0, sizeof(paved));
@@ -1316,57 +1346,62 @@ static void GenerateCity(void) {
             crossI[y][x] = -1; sigOff[y][x] = 0;
         }
 
-    for (int i = 0; i < 3; i++) {
-        for (int x = 0; x < MAP_W; x++) surface[roadRows[i]][x] = T_ROAD;
-        for (int y = 0; y < MAP_H; y++) surface[y][roadCols[i]] = T_ROAD;
+    // ---- Roads, river and tree belt from the layout ----------------------------------------------
+    for (int y = 0; y < MAP_H; y++) {
+        int n = (int)strlen(LAYOUT[y]);
+        for (int x = 0; x < MAP_W; x++) {
+            char c = x < n ? LAYOUT[y][x] : '.';
+            surface[y][x] = (c == '=') ? T_ROAD : (c == '~') ? T_RIVER : (c == 'T') ? T_TREE : T_GRASS;
+        }
     }
 
     // ---- Special zones -------------------------------------------------------
-    BuildCommunity(Z_GATED1, 5, 4, 10, 8, 6, 5);
-    BuildCommunity(Z_GATED2, 0, 4, 3, 8, 6, 3);
-    BuildCommunity(Z_GATED3, 5, 10, 10, 12, 11, 5);
+    // gated communities, each with its gate on the road beside it
+    BuildCommunity(Z_GATED1, 6, 4, 10, 8, 6, 6);
+    BuildCommunity(Z_GATED2, 1, 4, 4, 8, 6, 4);
+    BuildCommunity(Z_GATED3, 6, 16, 11, 19, 17, 6);
 
-    // Industrial zone (F factory, W warehouse, T tank farm, Y loading yard)
+    // Industrial estate (F factory, W warehouse, T tank farm, Y loading yard), x 23-28, y 10-12
     static const char *ind[3] = { "FFYWWT", "TYYYFF", "WWWYTF" };
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 6; c++) {
-            int x = 12 + c, y = 10 + r;
+            int x = 23 + c, y = 10 + r;
             char k = ind[r][c];
             zone[y][x] = Z_INDUSTRIAL;
             vr[y][x] = (unsigned char)GetRandomValue(0, 255);
-            if (k == 'Y') { paved[y][x] = 1; if (x == 14 && y == 10) gateTile[y][x] = true; continue; }
+            if (k == 'Y') { paved[y][x] = 1; continue; }
             surface[y][x] = T_BUILDING; bType[y][x] = B_IND;
             deco[y][x] = (k == 'F') ? 0 : (k == 'W' ? 1 : 2);        // building sub-type
             bHeight[y][x] = (k == 'F') ? 0.5f + Rf() * 0.2f : (k == 'W' ? 0.35f : 0.55f);
         }
-    gateTile[10][14] = true;
+    gateTile[10][25] = true;                                          // yard gate on the road at y = 9
 
-    // Landfill
+    // Landfill, x 30-34, y 10-12, with its gate on the road at x = 29
     for (int y = 10; y <= 12; y++)
-        for (int x = 19; x <= 23; x++) {
+        for (int x = 30; x <= 34; x++) {
             zone[y][x] = Z_LANDFILL; surface[y][x] = T_LANDFILL; vr[y][x] = (unsigned char)GetRandomValue(0, 255);
             bHeight[y][x] = 0.12f + Rf() * 0.22f;
         }
-    paved[11][19] = 1; gateTile[11][19] = true;
+    paved[11][30] = 1; gateTile[11][30] = true;
 
-    // Shopping centre + car park
-    for (int y = 4; y <= 8; y++)
-        for (int x = 19; x <= 23; x++) {
+    // Shopping centre + car park, x 6-12, y 10-14 (shops on the top two rows, car park beneath)
+    for (int y = 10; y <= 14; y++)
+        for (int x = 6; x <= 12; x++) {
             zone[y][x] = Z_MALL;
-            if (y <= 5 && x >= 20) { surface[y][x] = T_MALL; bType[y][x] = B_COM; bHeight[y][x] = 0.42f; faceDir[y][x] = 1; }
-            else if (!(x == 19 && y == 4)) {
+            if (y <= 11 && x >= 8) { surface[y][x] = T_MALL; bType[y][x] = B_COM; bHeight[y][x] = 0.42f; faceDir[y][x] = 1; }
+            else {
                 surface[y][x] = T_PARK;
                 for (int s = 0; s < 8; s++)
                     if (Rf() < 0.4f) { lot[y][x][s] = (unsigned char)(RandModel() + 1); lotCol[y][x][s] = (unsigned char)GetRandomValue(0, N_CARCOL - 1); }
             }
         }
 
-    // ---- Everything else: apartments, offices, skyrises, parkland ------------
+    // ---- Everything else: apartments, offices, skyrises, trees ---------------------------
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) {
             if (surface[y][x] != T_GRASS || zone[y][x] != 0) continue;
             bool nearRoad = IsRoad(x - 1, y) || IsRoad(x + 1, y) || IsRoad(x, y - 1) || IsRoad(x, y + 1);
-            bool downtown = (x >= 12 && x <= 17 && y <= 8);
+            bool downtown = (x >= 14 && x <= 21 && ((y >= 4 && y <= 8) || (y >= 10 && y <= 14)));
             int r = GetRandomValue(0, 99);
             vr[y][x] = (unsigned char)GetRandomValue(0, 255);
             if (nearRoad && r < 74) {
@@ -1383,28 +1418,32 @@ static void GenerateCity(void) {
         }
 
     // ---- Fixed city services ---------------------------------------------------
-    PlaceFixed(2, 2, T_FIRE_STN);
-    PlaceFixed(19, 4, T_FIRE_STN);
-    PlaceFixed(10, 2, T_POLICE_STN);
-    PlaceFixed(3, 11, T_POLICE_STN);
-    PlaceFixed(6, 2, T_HOSPITAL); bHeight[2][6] = 0.55f; bType[2][6] = B_COM;
+    PlaceFixed(3, 2, T_FIRE_STN);        faceDir[2][3] = 1;        // north-west fire station
+    PlaceFixed(21, 4, T_FIRE_STN);       faceDir[4][21] = 3;       // downtown fire station
+    PlaceFixed(12, 2, T_POLICE_STN);     faceDir[2][12] = 1;
+    PlaceFixed(4, 11, T_POLICE_STN);     faceDir[11][4] = 3;
+    PlaceFixed(9, 2, T_HOSPITAL); bHeight[2][9] = 0.55f; bType[2][9] = B_COM; faceDir[2][9] = 1;
     PlaceFixed(12, 6, T_POWER);
-    PlaceFixed(17, 6, T_WATER);
-    faceDir[2][6] = 1; faceDir[2][2] = 1; faceDir[4][19] = 3; faceDir[2][10] = 3; faceDir[11][3] = 3;
+    PlaceFixed(21, 8, T_WATER);      faceDir[8][21] = 3;
 
     // ---- Utility pipes: every road plus every built tile touching a road ------
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) {
             int s = surface[y][x], rx, ry;
             if (s == T_ROAD) pipeNode[y][x] = true;
-            else if (s != T_GRASS && s != T_TREE && FindAccess(x, y, &rx, &ry)) pipeNode[y][x] = true;
+            else if (s != T_GRASS && s != T_TREE && s != T_RIVER && FindAccess(x, y, &rx, &ry)) pipeNode[y][x] = true;
         }
 
-    // ---- Junction control ---------------------------------------------------------
-    for (int r = 0; r < 3; r++)
-        for (int c = 0; c < 3; c++) {
-            int x = roadCols[c], y = roadRows[r];
-            ctrl[y][x] = junction[r][c];
+    // ---- Junction control: signals at four-way crossings, stop signs at T-junctions, roundabouts at two of them ----
+    static const int roundabouts[2][2] = { { 13, 3 }, { 29, 15 } };
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) {
+            if (!IsRoad(x, y)) continue;
+            int n = RoadNeighbours(x, y);
+            if (n < 3) continue;
+            unsigned char c = (n >= 4) ? C_SIGNAL : C_STOP;
+            for (int i = 0; i < 2; i++) if (roundabouts[i][0] == x && roundabouts[i][1] == y) c = C_ROUNDABOUT;
+            ctrl[y][x] = c;
             sigOff[y][x] = Rf() * SIG_CYCLE;
             {   // start the signal phase machine at a random point of the 24 s cycle
                 float ta = sigOff[y][x];
@@ -1418,7 +1457,7 @@ static void GenerateCity(void) {
     // ---- Sidewalk graph + pedestrian crossings ----------------------------------
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++)
-            pedNode[y][x] = (surface[y][x] != T_ROAD) && RoadNeighbours(x, y) > 0;
+            pedNode[y][x] = (surface[y][x] != T_ROAD) && surface[y][x] != T_RIVER && RoadNeighbours(x, y) > 0;
 
     for (int y = 0; y < MAP_H; y++)
         for (int x = 0; x < MAP_W; x++) {
@@ -1432,18 +1471,20 @@ static void GenerateCity(void) {
                 if (ok) { crossT[ly][lx] = (unsigned char)ct; crossI[ly][lx] = ji; }
             }
         }
-    // Mid-block crossings at sensible places (gates, car park, shops, long straight blocks)
-    static const int mid[][2] = { {4,6},{18,6},{11,6},{8,3},{15,3},{21,3},{8,9},{15,9},{21,9},{8,13},{21,13},{4,11} };
-    for (unsigned i = 0; i < sizeof(mid) / sizeof(mid[0]); i++) {
-        int x = mid[i][0], y = mid[i][1];
-        if (!IsRoad(x, y) || RoadNeighbours(x, y) != 2 || RoadLine(x, y) == 0 || crossT[y][x]) continue;
-        bool nearCross = false;
-        for (int d = 0; d < 4; d++) if (InBounds(x + DX[d], y + DY[d]) && crossT[y + DY[d]][x + DX[d]]) nearCross = true;
-        if (nearCross) continue;
-        int ct = (RoadLine(x, y) == 2) ? 1 : 2;
-        bool ok = (ct == 1) ? (PedSide(x - 1, y) && PedSide(x + 1, y)) : (PedSide(x, y - 1) && PedSide(x, y + 1));
-        if (ok) { crossT[y][x] = (unsigned char)ct; crossI[y][x] = -1; }
-    }
+    // Mid-block crossings: about one straight block in eleven, kept clear of junctions
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) {
+            if (!IsRoad(x, y) || RoadNeighbours(x, y) != 2 || RoadLine(x, y) == 0 || crossT[y][x]) continue;
+            if (((x * 7 + y * 3) % 11) != 0) continue;
+            bool near = false;
+            for (int dy = -2; dy <= 2; dy++)
+                for (int dx = -2; dx <= 2; dx++)
+                    if (InBounds(x + dx, y + dy) && (ctrl[y + dy][x + dx] || crossT[y + dy][x + dx])) near = true;
+            if (near) continue;
+            int ct = (RoadLine(x, y) == 2) ? 1 : 2;
+            bool ok = (ct == 1) ? (PedSide(x - 1, y) && PedSide(x + 1, y)) : (PedSide(x, y - 1) && PedSide(x, y + 1));
+            if (ok) { crossT[y][x] = (unsigned char)ct; crossI[y][x] = -1; }
+        }
 
     // ---- Register stations --------------------------------------------------------
     nFire = nPolice = nHosp = 0;
@@ -2563,14 +2604,14 @@ static void UpdateDispatch(void) {
 #define FARM_SOLAR_Y1 7                    // inclusive
 #define N_TURB        8
 static const float TURB_POS[N_TURB][2] = {
-    { 29.5f, 1.5f }, { 29.5f, 4.0f }, { 29.5f, 6.5f }, { 26.5f, 11.5f },
-    { 28.5f, 11.5f }, { 25.8f, 14.3f }, { 27.8f, 14.3f }, { 29.6f, 14.3f }
+    { 41.5f, 1.5f }, { 41.5f, 4.0f }, { 41.5f, 6.5f }, { 38.5f, 11.5f },
+    { 40.5f, 11.5f }, { 37.8f, 14.3f }, { 39.8f, 14.3f }, { 41.6f, 14.3f }
 };
 #define TURB_KW       900.0f
 #define SOLAR_TILE_KW 110.0f
 
 // part of the landfill site is converted into a recycling plant in the smart city
-static bool IsRecycleTile(int x, int y) { return smartCity && surface[y][x] == T_LANDFILL && x <= 20; }
+static bool IsRecycleTile(int x, int y) { return smartCity && surface[y][x] == T_LANDFILL && x <= 32; }
 
 static float SunK(void) { return powf(Clamp(st.daylight, 0.0f, 1.0f), 1.3f) * (1.0f - 0.7f * rain); }
 static float WindFactor(void) { return Clamp((windSpeed - 0.12f) / 0.55f, 0.0f, 1.0f); }
@@ -3298,7 +3339,7 @@ static bool FpSolid(float px, float pz) {
         if (!smartCity) return false;
         if (px > MAP_W + FARM_W - 0.06f || pz < 0.06f || pz > MAP_H - 0.06f) return true;         // perimeter fence
         if (pz >= FARM_SOLAR_Y0 && pz < FARM_SOLAR_Y1 + 1.0f && px >= FARM_SOLAR_X0 && px < FARM_SOLAR_X1 + 1.0f) return true;   // panels
-        if (px > 24.12f && px < 24.88f && pz > 11.08f && pz < 13.92f) return true;              // battery containers
+        if (px > 36.12f && px < 36.88f && pz > 11.08f && pz < 13.92f) return true;              // battery containers
         for (int i = 0; i < N_TURB; i++) { float dx = px - TURB_POS[i][0], dz = pz - TURB_POS[i][1]; if (dx * dx + dz * dz < 0.07f * 0.07f) return true; }
         return false;
     }
@@ -3982,6 +4023,97 @@ static Color NoiseColorAt(int x, int y) {
 }
 
 // ---------------------------------------------------------------------------
+// 15-minute city (KPI).  The share of residents who can walk to a shop, a hospital and a park
+// in 15 minutes, measured along the real footpath and road network rather than in a straight line.
+// One tile is taken as 100 m and the walking pace as 80 m a minute, so 15 minutes is 12 tiles.
+// Residents are counted the same way as the population: 22 per residential building tile, 6 per
+// house.  Reported only.  The simulation has no schools yet, so schools are not measured.
+// ---------------------------------------------------------------------------
+#define TILE_M            100.0f   // metres of city per tile
+#define WALK_M_PER_MIN     80.0f   // comfortable walking pace
+#define WALK_LIMIT_MIN    15.0f
+#define N_SVC               3      // 0 = shop, 1 = hospital, 2 = park
+#define RES_POP_BLDG      22.0f    // residents per residential building tile
+#define RES_POP_HOUSE      6.0f    // residents per house
+
+static bool WalkTile(int x, int y) {
+    return InBounds(x, y) && (surface[y][x] == T_ROAD || pedNode[y][x] || surface[y][x] == T_PARK);
+}
+
+static bool ServiceTile(int svc, int x, int y) {
+    switch (svc) {
+        case 0:  return (surface[y][x] == T_BUILDING && bType[y][x] == B_COM) || surface[y][x] == T_MALL;
+        case 1:  return surface[y][x] == T_HOSPITAL;
+        default: return surface[y][x] == T_PARK;
+    }
+}
+
+// Footpath steps from the nearest service of this kind to every walkable tile (-1 = cannot be reached)
+static void ServiceSteps(int svc, int dist[MAP_H][MAP_W]) {
+    static int q[MAP_W * MAP_H];
+    int head = 0, tail = 0;
+    for (int y = 0; y < MAP_H; y++) for (int x = 0; x < MAP_W; x++) dist[y][x] = -1;
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) {
+            if (!ServiceTile(svc, x, y)) continue;
+            if (WalkTile(x, y) && dist[y][x] < 0) { dist[y][x] = 0; q[tail++] = y * MAP_W + x; }   // a park is walked on directly
+            for (int d = 0; d < 4; d++) {
+                int nx = x + DX[d], ny = y + DY[d];
+                if (WalkTile(nx, ny) && dist[ny][nx] < 0) { dist[ny][nx] = 0; q[tail++] = ny * MAP_W + nx; }
+            }
+        }
+    while (head < tail) {
+        int c = q[head++], cx = c % MAP_W, cy = c / MAP_W;
+        for (int d = 0; d < 4; d++) {
+            int nx = cx + DX[d], ny = cy + DY[d];
+            if (WalkTile(nx, ny) && dist[ny][nx] < 0) { dist[ny][nx] = dist[cy][cx] + 1; q[tail++] = ny * MAP_W + nx; }
+        }
+    }
+}
+
+static void UpdateWalk15(float dt) {
+    static float acc = 0.0f;
+    twSum[smartCity ? 1 : 0][TW_ACCESS15] += access15All * dt;   // every frame, so the twin average is time-weighted
+    acc += dt;
+    if (acc < 1.0f) return;                               // the walk itself is recomputed once a second
+    acc = 0.0f;
+
+    static int dist[N_SVC][MAP_H][MAP_W];
+    for (int s = 0; s < N_SVC; s++) ServiceSteps(s, dist[s]);
+
+    float pop = 0.0f, all = 0.0f, ok[N_SVC] = { 0.0f, 0.0f, 0.0f };
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) {
+            float w;
+            if (surface[y][x] == T_BUILDING && bType[y][x] == B_RES) w = RES_POP_BLDG;
+            else if (surface[y][x] == T_HOUSE) w = RES_POP_HOUSE;
+            else continue;
+            pop += w;
+
+            bool everything = true;
+            for (int s = 0; s < N_SVC; s++) {
+                int best = -1;                            // steps from the house to its nearest reachable footpath
+                for (int d = 0; d < 4; d++) {
+                    int nx = x + DX[d], ny = y + DY[d];
+                    if (!WalkTile(nx, ny) || dist[s][ny][nx] < 0) continue;
+                    int steps = dist[s][ny][nx] + 1;
+                    if (best < 0 || steps < best) best = steps;
+                }
+                bool near = best >= 0 && best * TILE_M / WALK_M_PER_MIN <= WALK_LIMIT_MIN;
+                if (near) ok[s] += w; else everything = false;
+            }
+            if (everything) all += w;
+        }
+
+    if (pop > 0.0f) {
+        access15Shop = 100.0f * ok[0] / pop;
+        access15Hosp = 100.0f * ok[1] / pop;
+        access15Park = 100.0f * ok[2] / pop;
+        access15All  = 100.0f * all / pop;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Heat / pollution maps, statistics, simulation driver
 // ---------------------------------------------------------------------------
 static void UpdateMaps(void) {
@@ -4190,6 +4322,7 @@ static void UpdateSim(float dt) {
     UpdateHappiness(dt);
     UpdateCarbon(dt);
     UpdateNoise(dt);
+    UpdateWalk15(dt);
     UpdateFire(dt);
     EmitChimneys(dt);
     UpdateParticles(dt);
@@ -4656,6 +4789,7 @@ static void DrawGround2D(int x, int y, bool xray) {
         else if (s == T_LANDFILL) base = IsRecycleTile(x, y) ? (Color){ 150, 150, 152, 255 } : (Color){ 112, 94, 72, 255 };
         else if (paved[y][x]) base = xray ? COL_ROAD_DIM : (Color){ 150, 150, 152, 255 };
         else if (s == T_HOUSE) base = xray ? COL_SOIL : (Color){ 92, 168, 76, 255 };
+        else if (s == T_RIVER) base = xray ? COL_ROAD_DIM : COL_RIVER;
         DrawRectangle(px, py, TILE, TILE, base);
         if (s == T_PARK && !xray) {                      // parking bays
             for (int c = 0; c <= 4; c++) DrawRectangle(px + c * TILE / 4, py + 2, 1, TILE - 4, Fade(WHITE, 0.55f));
@@ -6102,12 +6236,12 @@ static void DrawFarmStatic3D(void) {
                     SolarPanel(px, 0.085f, pz, 0.40f, 0.30f, 24.0f);
                 }
     // grid hub: battery containers + transformer
-    BoxT(TX_CONCRETE, 24.5f, 0.02f, 12.6f, 0.95f, 0.04f, 3.0f, WHITE);
+    BoxT(TX_CONCRETE, 36.5f, 0.02f, 12.6f, 0.95f, 0.04f, 3.0f, WHITE);
     for (int k = 0; k < 3; k++) {
-        BoxT(TX_CORRUG, 24.5f, 0.17f, 11.5f + k * 1.0f, 0.70f, 0.26f, 0.80f, A((Color){ 215, 240, 225, 255 }));
-        for (int s = 0; s < 6; s++) BoxC(24.5f - 0.25f + s * 0.1f, 0.17f, 11.5f + k * 1.0f + 0.404f, 0.05f, 0.12f, 0.004f, A((Color){ 60, 215, 120, 255 }));
+        BoxT(TX_CORRUG, 36.5f, 0.17f, 11.5f + k * 1.0f, 0.70f, 0.26f, 0.80f, A((Color){ 215, 240, 225, 255 }));
+        for (int s = 0; s < 6; s++) BoxC(36.5f - 0.25f + s * 0.1f, 0.17f, 11.5f + k * 1.0f + 0.404f, 0.05f, 0.12f, 0.004f, A((Color){ 60, 215, 120, 255 }));
     }
-    GCylinder(V3(25.1f, 0.04f, 12.0f), 0.07f, 0.07f, 0.22f, 10, A((Color){ 170, 175, 182, 255 }));
+    GCylinder(V3(37.1f, 0.04f, 12.0f), 0.07f, 0.07f, 0.22f, 10, A((Color){ 170, 175, 182, 255 }));
     // perimeter fence (north, south, east)
     Color fc = A((Color){ 150, 155, 160, 255 });
     for (int x = MAP_W; x <= MAP_W + FARM_W; x++) { BoxC((float)x, 0.06f, 0.0f, 0.012f, 0.12f, 0.012f, fc); BoxC((float)x, 0.06f, (float)MAP_H, 0.012f, 0.12f, 0.012f, fc); }
@@ -6310,7 +6444,7 @@ static void DrawPlusWorld3D(void) {
 static void DrawPlusFarm3D(void) {
     float f = Clamp(rainTankKL / RAIN_TANK_CAP, 0.0f, 1.0f);
     for (int i = 0; i < 2; i++) {
-        float tx = 24.8f + i * 1.15f, tz = 8.5f;
+        float tx = 36.8f + i * 1.15f, tz = 8.5f;
         GCylinder((Vector3){ tx, 0.03f, tz }, 0.31f, 0.31f, 0.36f, 20, A((Color){ 205, 212, 218, 255 }));
         GCylinder((Vector3){ tx, 0.39f, tz }, 0.0f, 0.31f, 0.06f, 20, A((Color){ 150, 158, 166, 255 }));
         GCylinder((Vector3){ tx, 0.04f, tz }, 0.318f, 0.318f, 0.30f * f + 0.002f, 20, A((Color){ 70, 150, 245, 255 }));
@@ -6318,8 +6452,8 @@ static void DrawPlusFarm3D(void) {
         BoxC(tx + 0.36f, 0.04f + 0.15f * f, tz, 0.026f, 0.30f * f + 0.004f, 0.026f, A((Color){ 90, 180, 255, 255 }));
     }
     float rf = Clamp(retentionKL / RETENTION_CAP, 0.0f, 1.0f);
-    BoxC(28.25f, 0.016f, 8.5f, 3.10f, 0.032f, 0.82f, A((Color){ 120, 100, 70, 255 }));
-    BoxC(28.25f, 0.030f + 0.02f * rf, 8.5f, 2.96f, 0.012f + 0.04f * rf, 0.68f, A((Color){ 60 + (int)(50 * rf), 125 + (int)(60 * rf), 215, 255 }));
+    BoxC(40.25f, 0.016f, 8.5f, 3.10f, 0.032f, 0.82f, A((Color){ 120, 100, 70, 255 }));
+    BoxC(40.25f, 0.030f + 0.02f * rf, 8.5f, 2.96f, 0.012f + 0.04f * rf, 0.68f, A((Color){ 60 + (int)(50 * rf), 125 + (int)(60 * rf), 215, 255 }));
 }
 
 // ---------------------------------------------------------------------------
@@ -6476,7 +6610,7 @@ static Camera3D BuildCamera(void) {
 
 static void ResetCamera(void) {
     oc.target = (Vector3){ (MAP_W + (smartCity ? FARM_W : 0)) / 2.0f, 0.0f, MAP_H / 2.0f };
-    oc.yaw = 0.0f; oc.pitch = 1.0f; oc.dist = smartCity ? 29.0f : 24.0f;
+    oc.yaw = 0.0f; oc.pitch = 1.0f; oc.dist = smartCity ? 43.0f : 36.0f;
 }
 
 static void UpdateOrbit(float dt) {
@@ -6731,6 +6865,7 @@ static void DrawGround3D(int x, int y, bool xray) {
         return;
     }
     if (xray)                BoxC(cx, GROUND_TOP * 0.5f, cz, 1.0f, GROUND_TOP, 1.0f, COL_SOIL);
+    else if (s == T_RIVER)   BoxC(cx, GROUND_TOP * 0.4f, cz, 1.0f, GROUND_TOP * 0.8f, 1.0f, COL_RIVER);
     else if (s == T_PARK)    BoxT(TX_ASPHALT, cx, GROUND_TOP * 0.5f, cz, 1.0f, GROUND_TOP, 1.0f, WHITE);
     else if (s == T_LANDFILL) { if (IsRecycleTile(x, y)) BoxT(TX_CONCRETE, cx, GROUND_TOP * 0.5f, cz, 1.0f, GROUND_TOP, 1.0f, (Color){ 215, 215, 215, 255 }); else BoxT(TX_TRASH, cx, GROUND_TOP * 0.5f, cz, 1.0f, GROUND_TOP, 1.0f, WHITE); }
     else if (paved[y][x])    BoxT(TX_CONCRETE, cx, WALK_TOP * 0.5f, cz, 1.0f, WALK_TOP, 1.0f, (Color){ 215, 215, 215, 255 });
@@ -6950,6 +7085,7 @@ static void DrawDashboard(void) {
     double co1 = (twTime[1] > 8 && twSum[1][TW_POP] > 0) ? twSum[1][TW_CARBON_PP] / twSum[1][TW_POP] * HOURS_PER_YEAR : NAN;
     TwRow(&y, x, "CO2 per resident (t/yr)",      co0, co1, "%.1f", true);
     TwRow(&y, x, "Average noise (dB)",           TwAvg(0, TW_NOISE),  TwAvg(1, TW_NOISE),  "%.1f", true);
+    TwRow(&y, x, "Residents within 15 min (%)",  TwAvg(0, TW_ACCESS15), TwAvg(1, TW_ACCESS15), "%.0f", false);
     y += 2;
     snprintf(b, sizeof(b), "recorded: normal %.2f days   smart %.2f days  (1 day = %d s)", twTime[0] / DAY_LEN, twTime[1] / DAY_LEN, (int)DAY_LEN);
     DrawText(b, x, y, 10, GRAY); y += 12;
