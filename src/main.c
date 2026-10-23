@@ -3,7 +3,7 @@
 // Layout:  [ LEFT: layers + live statistics ] [ MAP VIEW (2D / 3D) ] [ RIGHT: trend graphs ]
 //
 // Controls:
-//   1-8 (or click)  Toggle layers: Buildings, Roads, Water, Sewer, Traffic, Congestion, Heat, Pollution
+//   1-9 (or click)  Toggle layers: Buildings, Roads, Water, Sewer, Traffic, Congestion, Heat, Pollution, Noise
 //   V               Switch 2D / 3D view
 //   3D view         WASD / arrows = move, Q/E = rotate, mouse wheel = zoom,
 //                   right-mouse drag = orbit/tilt, R = reset camera, Shift = move faster
@@ -70,7 +70,7 @@
 #define SEWER_CAP   8500.0f    // sewer capacity (litres/min)
 
 #define LAYER_Y0    84
-#define LAYER_H     15
+#define LAYER_H     12
 #define ROW_H       12
 
 typedef enum {
@@ -82,7 +82,7 @@ typedef enum {
 enum { B_RES = 0, B_COM, B_IND };
 enum { Z_NONE = 0, Z_GATED1, Z_GATED2, Z_GATED3, Z_INDUSTRIAL, Z_LANDFILL, Z_MALL };
 enum { C_NONE = 0, C_SIGNAL, C_ROUNDABOUT, C_STOP };
-enum { L_BUILDINGS = 0, L_ROADS, L_WATER, L_SEWER, L_TRAFFIC, L_CONGESTION, L_HEAT, L_POLLUTION, L_COUNT };
+enum { L_BUILDINGS = 0, L_ROADS, L_WATER, L_SEWER, L_TRAFFIC, L_CONGESTION, L_HEAT, L_POLLUTION, L_NOISE, L_COUNT };
 enum { G_ENERGY = 0, G_WATER, G_SEWER, G_AQI, G_TEMP, G_RAIN, G_CARS, G_COUNT };
 typedef enum { VIEW_2D = 0, VIEW_3D, VIEW_FP } ViewMode;
 enum { V_SALOON = 0, V_HATCH, V_ESTATE, V_PICKUP, V_SUV, V_VAN, V_TRUCK, V_BIKE, V_COUNT };
@@ -203,11 +203,12 @@ static const Color SHIRT_COLS[8] = {
 };
 static const char *LAYER_NAMES[L_COUNT] = {
     "Buildings", "Roads & sidewalks", "Water network", "Sewer network",
-    "Traffic", "Congestion", "Heat map", "Pollution map"
+    "Traffic", "Congestion", "Heat map", "Pollution map", "Noise map"
 };
 static const Color LAYER_COL[L_COUNT] = {
     { 185, 120,  98, 255 }, { 150, 150, 155, 255 }, {  70, 150, 255, 255 }, { 170, 115,  55, 255 },
-    { 240, 210,  50, 255 }, {  90, 220, 140, 255 }, { 235,  80,  50, 255 }, { 170,  60, 170, 255 }
+    { 240, 210,  50, 255 }, {  90, 220, 140, 255 }, { 235,  80,  50, 255 }, { 170,  60, 170, 255 },
+    { 120, 170, 230, 255 }
 };
 
 // ---------------------------------------------------------------------------
@@ -280,7 +281,7 @@ static float hist[G_COUNT][HIST];
 static int   histIdx = 0;
 static bool  histInit = false;
 
-static bool     layerOn[L_COUNT] = { true, true, false, false, true, true, false, false };
+static bool     layerOn[L_COUNT] = { true, true, false, false, true, true, false, false, false };
 static ViewMode viewMode = VIEW_2D;
 static OrbitCam oc;
 static bool hoverOK = false;
@@ -496,8 +497,17 @@ static float budIncomeK = 0.0f, budSpendK = 0.0f;   // income and spending, k$ p
 static float happyNow = 0.0f;           // current score
 static int   happyLow = 0;              // index of the weakest measure (HAP_NAME in p6g_happy.c)
 
+// ---- jobs and employment (KPI): reported only ---------------------------------------------
+static float jobsNow = 0.0f, labourNow = 0.0f, employedNow = 0.0f, employRate = 0.0f;
+
+// ---- carbon and noise (KPIs) and the noise map: reported only --------------------------------
+static float carbonPowerTph = 0.0f, carbonTrafficTph = 0.0f, carbonPerPerson = 0.0f;   // t CO2 per hour, t per resident per year
+static float evShare = 0.0f;                                                             // share of cars that are electric (smart city)
+static float noiseMap[MAP_H][MAP_W];                                                     // dB at each tile
+static float noiseAvg = 0.0f, noiseLoudPct = 0.0f;
+
 // ---- digital-twin recorder: time-weighted averages kept separately for each mode ----------------
-enum { TW_AQI = 0, TW_FOSSIL, TW_CO2, TW_DEMAND, TW_LIGHT, TW_SPEED, TW_STOP, TW_LEAK, TW_BUDGET, TW_HAPPY, TW_COUNT };
+enum { TW_AQI = 0, TW_FOSSIL, TW_CO2, TW_DEMAND, TW_LIGHT, TW_SPEED, TW_STOP, TW_LEAK, TW_BUDGET, TW_HAPPY, TW_EMPLOY, TW_CARBON_PP, TW_NOISE, TW_POP, TW_COUNT };
 static double twSum[2][TW_COUNT], twTime[2];
 static double twNight[2];
 static float demandBaseKW = 1.0f;
@@ -3788,6 +3798,7 @@ static void UpdateFp(float dt) {
 #define BUD_LAMP_PER_DAY       0.05f     // smart street lamp: maintenance and data link
 #define BUD_BIN_PER_DAY        0.03f     // smart bin: fill sensor and data link
 #define BUD_MONITOR_PER_DAY    0.20f     // smart traffic monitor mast
+#define BUD_INCOME_TAX_PER_WORKER 0.015f // income tax per employed resident per day (see p6h_jobs.c)
 
 // Income and spending right now (k$ per simulated day)
 static void BudgetRates(float *income, float *spend) {
@@ -3801,6 +3812,7 @@ static void BudgetRates(float *income, float *spend) {
 
     *income = st.population * BUD_TAX_PER_RESIDENT
             + shops * BUD_RATE_PER_BUSINESS
+            + employedNow * BUD_INCOME_TAX_PER_WORKER
             + st.energyDemand * BUD_TARIFF_PER_KW_DAY;
 
     float fuelKW = smartCity ? gridImportKW : st.energyDemand;   // smart city burns only the backup import
@@ -3853,6 +3865,120 @@ static void UpdateHappiness(float dt) {
         if (part[i] < part[happyLow]) happyLow = i;
     }
     twSum[smartCity ? 1 : 0][TW_HAPPY] += happyNow * dt;     // time-weighted average, kept per mode
+}
+
+// ---------------------------------------------------------------------------
+// Jobs and employment (KPI).  Workplaces provide jobs.  Residents of working age make up the
+// labour force, and the employment rate is employed residents / labour force.  Workers pay
+// income tax into the city budget.  Reported only: nothing in the simulation reads it back.
+// ---------------------------------------------------------------------------
+#define JOB_SHOP          10     // per shop or office building
+#define JOB_FACTORY       25     // per industrial building
+#define JOB_MALL_TILE      8     // per mall tile
+#define JOB_RECYCLE_TILE  10     // per recycling-plant tile (smart city)
+#define JOB_TURBINE        3     // per wind turbine (smart city)
+#define JOB_DRONE_HUB     12     // drone fulfilment hub staff (smart city)
+#define LABOUR_SHARE    0.60f    // share of residents who are of working age
+
+static void UpdateJobs(float dt) {
+    int shops = 0, factories = 0, mall = 0, recycle = 0;
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) {
+            if (surface[y][x] == T_BUILDING && bType[y][x] == B_COM) shops++;
+            if (surface[y][x] == T_BUILDING && bType[y][x] == B_IND) factories++;
+            if (surface[y][x] == T_MALL) mall++;
+            if (IsRecycleTile(x, y)) recycle++;
+        }
+
+    jobsNow = shops * JOB_SHOP + factories * JOB_FACTORY + mall * JOB_MALL_TILE;
+    if (smartCity) jobsNow += recycle * JOB_RECYCLE_TILE + N_TURB * JOB_TURBINE + JOB_DRONE_HUB;
+
+    labourNow   = st.population * LABOUR_SHARE;
+    employedNow = fminf(jobsNow, labourNow);                  // more jobs than workers leaves no one unemployed
+    employRate  = labourNow > 0.0f ? 100.0f * employedNow / labourNow : 0.0f;
+    twSum[smartCity ? 1 : 0][TW_EMPLOY] += employRate * dt;   // time-weighted average, kept per mode
+}
+
+// ---------------------------------------------------------------------------
+// Carbon and noise (KPIs and a map).
+//   Carbon: CO2 from fuel burned at the power plant, plus CO2 from petrol and diesel cars on the
+//           road (electric cars emit nothing on the road).  Reported as tonnes per resident per year.
+//   Noise:  each tile has a source level from its traffic, factories, shops, the mall, the landfill
+//           or recycling plant, and fires.  The map shows the energy average of the sources within
+//           two tiles, which is roughly what someone standing on that tile hears, in dB.
+// Reported only: nothing in the simulation reads these back.
+// ---------------------------------------------------------------------------
+#define CO2_POWER_T_PER_KWH   0.0004f   // t CO2 per kWh burned (same figure as the digital-twin table)
+#define CO2_CAR_MOVING_T_PER_H 0.006f   // petrol or diesel car at about 30 km/h (about 0.2 kg per km)
+#define CO2_CAR_IDLE_T_PER_H   0.002f   // the same car standing with its engine running
+#define HOURS_PER_YEAR        8760.0f
+
+#define NOISE_BASE_DB         38.0f     // quiet background: parks, houses, open ground
+#define NOISE_LOUD_DB         70.0f     // tiles above this count as loud
+
+static void UpdateCarbon(float dt) {
+    float fossilKW = smartCity ? gridImportKW : st.energyDemand;   // smart city burns only the backup import
+    evShare = (smartCity && parkedCars > 0) ? Clamp((float)evCount / (float)parkedCars, 0.0f, 1.0f) : 0.0f;
+
+    int moving = 0, idle = 0;
+    for (int i = 0; i < MAX_CARS; i++) {
+        Car *c = &cars[i];
+        if (!c->active || c->type == V_BIKE) continue;              // bikes emit nothing
+        if (c->speedNow > 0.05f) moving++; else idle++;             // speed is in tiles per second
+    }
+
+    float combustion = 1.0f - evShare;
+    carbonPowerTph   = fossilKW * CO2_POWER_T_PER_KWH;
+    carbonTrafficTph = combustion * (moving * CO2_CAR_MOVING_T_PER_H + idle * CO2_CAR_IDLE_T_PER_H);
+    carbonPerPerson  = st.population > 0 ? (carbonPowerTph + carbonTrafficTph) * HOURS_PER_YEAR / st.population : 0.0f;
+    // the digital twin divides total tonnes by total resident-time, so early small-population
+    // readings do not skew the average (see the dashboard)
+    twSum[smartCity ? 1 : 0][TW_CARBON_PP] += (carbonPowerTph + carbonTrafficTph) * dt;   // t CO2, per mode
+    twSum[smartCity ? 1 : 0][TW_POP]       += st.population * dt;                         // resident-seconds, per mode
+}
+
+static void UpdateNoise(float dt) {
+    static float srcE[MAP_H][MAP_W];                                 // source levels as sound energy
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) {
+            float L = NOISE_BASE_DB;
+            switch (surface[y][x]) {
+                case T_ROAD:     L = NOISE_BASE_DB + 12.0f * traffic[y][x] - 5.0f * evShare - 3.0f * rain; break;
+                case T_BUILDING: L = (bType[y][x] == B_IND) ? 58.0f : (bType[y][x] == B_COM ? 50.0f : NOISE_BASE_DB); break;
+                case T_MALL:     L = 55.0f; break;
+                case T_LANDFILL: L = IsRecycleTile(x, y) ? 52.0f : 45.0f; break;
+                default:         break;
+            }
+            if (fireI[y][x] > 0.0f) L += 12.0f * fireI[y][x] / 100.0f;
+            if (L < 0.0f) L = 0.0f;
+            srcE[y][x] = powf(10.0f, L / 10.0f);
+        }
+
+    float loud = 0.0f, sum = 0.0f;
+    for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++) {
+            float e = 0.0f, wsum = 0.0f;
+            for (int dy = -2; dy <= 2; dy++)
+                for (int dx = -2; dx <= 2; dx++) {
+                    int nx = x + dx, ny = y + dy;
+                    if (!InBounds(nx, ny)) continue;
+                    float w = 1.0f / (1.0f + (float)(dx * dx + dy * dy));   // nearer sources count for more
+                    e += w * srcE[ny][nx]; wsum += w;
+                }
+            noiseMap[y][x] = 10.0f * log10f(e / wsum + 1e-6f);
+            sum += noiseMap[y][x];
+            if (noiseMap[y][x] > NOISE_LOUD_DB) loud++;
+        }
+    noiseAvg     = sum / (MAP_W * MAP_H);
+    noiseLoudPct = 100.0f * loud / (MAP_W * MAP_H);
+    twSum[smartCity ? 1 : 0][TW_NOISE] += noiseAvg * dt;             // time-weighted average, kept per mode
+}
+
+// Noise map colour: green = quiet (45 dB), yellow = 60 dB, red = loud (75 dB)
+static Color NoiseColorAt(int x, int y) {
+    Color c = Ramp3((Color){ 90, 210, 110, 255 }, (Color){ 235, 200, 60, 255 }, (Color){ 230, 60, 50, 255 }, (noiseMap[y][x] - 45.0f) / 30.0f);
+    c.a = 150;
+    return c;
 }
 
 // ---------------------------------------------------------------------------
@@ -4059,8 +4185,11 @@ static void UpdateSim(float dt) {
     UpdateMedical(dt);
     UpdateWind(dt);
     UpdatePlus(dt);
+    UpdateJobs(dt);
     UpdateBudget(dt);
     UpdateHappiness(dt);
+    UpdateCarbon(dt);
+    UpdateNoise(dt);
     UpdateFire(dt);
     EmitChimneys(dt);
     UpdateParticles(dt);
@@ -4815,6 +4944,8 @@ static void DrawScene2D(void) {
         for (int y = 0; y < MAP_H; y++) for (int x = 0; x < MAP_W; x++) DrawRectangle(x * TILE, y * TILE, TILE, TILE, HeatColorAt(x, y));
     if (layerOn[L_POLLUTION])
         for (int y = 0; y < MAP_H; y++) for (int x = 0; x < MAP_W; x++) DrawRectangle(x * TILE, y * TILE, TILE, TILE, PolColorAt(x, y));
+    if (layerOn[L_NOISE])
+        for (int y = 0; y < MAP_H; y++) for (int x = 0; x < MAP_W; x++) DrawRectangle(x * TILE, y * TILE, TILE, TILE, NoiseColorAt(x, y));
 
     // burning tiles glow underneath the flame particles
     for (int y = 0; y < MAP_H; y++)
@@ -6683,6 +6814,7 @@ static void DrawLiveScene(bool xray) {
             }
             if (layerOn[L_HEAT])      BoxC(cx, 0.080f, cz, 1.0f, 0.01f, 1.0f, HeatColorAt(x, y));
             if (layerOn[L_POLLUTION]) BoxC(cx, 0.095f, cz, 1.0f, 0.01f, 1.0f, PolColorAt(x, y));
+            if (layerOn[L_NOISE])     BoxC(cx, 0.0965f, cz, 1.0f, 0.01f, 1.0f, NoiseColorAt(x, y));
             if (fireI[y][x] > 0.0f)   BoxC(cx, 0.07f, cz, 0.85f, 0.01f, 0.85f, Fade(COL_FIRE, 0.15f + 0.3f * fireI[y][x] / 100.0f));
             if (layerOn[L_ROADS] && pedNode[y][x] && ((x * 3 + y * 5) % 4 == 0) && s != T_ROAD) DrawStreetLampGlow(x, y);
             if (layerOn[L_BUILDINGS]) {
@@ -6812,6 +6944,12 @@ static void DrawDashboard(void) {
     TwRow(&y, x, "Patients lost (count)",        twTime[0] > 8 ? twLost[0] : NAN, twTime[1] > 8 ? twLost[1] : NAN, "%.0f", true);
     TwRow(&y, x, "City budget net (k$/day)",     TwAvg(0, TW_BUDGET), TwAvg(1, TW_BUDGET), "%.2f", false);
     TwRow(&y, x, "Citizen happiness (0-100)",    TwAvg(0, TW_HAPPY),  TwAvg(1, TW_HAPPY),  "%.0f", false);
+    TwRow(&y, x, "Employment rate (%)",          TwAvg(0, TW_EMPLOY), TwAvg(1, TW_EMPLOY), "%.0f", false);
+    // total tonnes divided by total resident-time, then scaled to a year
+    double co0 = (twTime[0] > 8 && twSum[0][TW_POP] > 0) ? twSum[0][TW_CARBON_PP] / twSum[0][TW_POP] * HOURS_PER_YEAR : NAN;
+    double co1 = (twTime[1] > 8 && twSum[1][TW_POP] > 0) ? twSum[1][TW_CARBON_PP] / twSum[1][TW_POP] * HOURS_PER_YEAR : NAN;
+    TwRow(&y, x, "CO2 per resident (t/yr)",      co0, co1, "%.1f", true);
+    TwRow(&y, x, "Average noise (dB)",           TwAvg(0, TW_NOISE),  TwAvg(1, TW_NOISE),  "%.1f", true);
     y += 2;
     snprintf(b, sizeof(b), "recorded: normal %.2f days   smart %.2f days  (1 day = %d s)", twTime[0] / DAY_LEN, twTime[1] / DAY_LEN, (int)DAY_LEN);
     DrawText(b, x, y, 10, GRAY); y += 12;
@@ -6938,7 +7076,7 @@ static void DrawLeftPanel(void) {
     DrawRectangleLinesEx(db, 1.0f, (Color){ 90, 130, 190, 255 });
     DrawText("[Tab] data", (int)db.x + 6, (int)db.y + 6, 10, SKYBLUE);
 
-    DrawText("LAYERS  (click or press 1-8)", 12, LAYER_Y0 - 12, 10, GRAY);
+    DrawText("LAYERS  (click or press 1-9)", 12, LAYER_Y0 - 12, 10, GRAY);
     for (int i = 0; i < L_COUNT; i++) {
         Rectangle r = LayerRect(i);
         if (CheckCollisionPointRec(m, r)) DrawRectangleRec(r, (Color){ 40, 46, 58, 255 });
@@ -6952,7 +7090,7 @@ static void DrawLeftPanel(void) {
     uiY = LAYER_Y0 + L_COUNT * LAYER_H + 13;
     int mins = (int)((st.hour - (int)st.hour) * 60.0f);
     StatRow("Time", TextFormat("Day %d  %02d:%02d  x%.1f%s", st.day, (int)st.hour, mins, simSpeed, paused ? " PAUSED" : ""), RAYWHITE);
-    StatRow("Population", TextFormat("%d", st.population), GREEN);
+    StatRow("Population", TextFormat("%d  (%.0f%% employed)", st.population, employRate), GREEN);
     StatRow("Buildings", TextFormat("%d  (%d damaged)", st.buildings, st.damaged), RAYWHITE);
     StatRow("Green space", TextFormat("%.0f%%", st.green), (Color){ 110, 200, 100, 255 });
     StatBar(smartCity ? "Energy (renewable supply)" : "Energy (power plant)", TextFormat("%.1f / %.1f MW", st.energyDemand / 1000.0f, st.energyCap / 1000.0f), st.energyPct, ORANGE);
@@ -6972,6 +7110,7 @@ static void DrawLeftPanel(void) {
     StatRow("Medical", TextFormat("%d calls / %d saved / %d lost", medCalls, medSaved, medLost), (Color){ 255, 120, 130, 255 });
     StatRow("City budget", TextFormat("%+.1f k$  (%+.2f k$/day)", budBalanceK, budIncomeK - budSpendK), budBalanceK >= 0.0f ? (Color){ 120, 230, 140, 255 } : (Color){ 245, 110, 90, 255 });
     StatRow("Happiness", TextFormat("%.0f / 100  (low: %s)", happyNow, HAP_NAME[happyLow]), happyNow >= 70.0f ? (Color){ 120, 230, 140, 255 } : happyNow >= 40.0f ? (Color){ 245, 215, 120, 255 } : (Color){ 245, 110, 90, 255 });
+    StatRow("CO2 per resident", TextFormat("%.1f t/yr", carbonPerPerson), carbonPerPerson <= 10.0f ? (Color){ 120, 230, 140, 255 } : carbonPerPerson <= 20.0f ? (Color){ 245, 215, 120, 255 } : (Color){ 245, 110, 90, 255 });
     if (smartCity) StatRow("Recycling", TextFormat("%.0f%% diverted  (%.0f t)", recycledT + wasteT > 0 ? 100.0f * recycledT / (recycledT + wasteT) : 64.0f, recycledT), (Color){ 90, 220, 140, 255 });
     else           StatRow("Power source", "fuel-burning plant", (Color){ 200, 160, 110, 255 });
 
@@ -7217,6 +7356,10 @@ int main(void) {
             if (layerOn[L_POLLUTION]) {
                 DrawRectangle(PANEL_W + 6, VIEW_H - 20, 240, 14, Fade(BLACK, 0.6f));
                 DrawText("Pollution map: green = clean, purple = dirty", PANEL_W + 10, VIEW_H - 17, 10, WHITE);
+            }
+            if (layerOn[L_NOISE]) {
+                DrawRectangle(PANEL_W + 6, VIEW_H - 52, 340, 14, Fade(BLACK, 0.6f));
+                DrawText(TextFormat("Noise map: green = quiet (45 dB), red = loud (75 dB)  avg %.0f dB", noiseAvg), PANEL_W + 10, VIEW_H - 49, 10, WHITE);
             }
             if (paused) DrawText("PAUSED", PANEL_W + VIEW_W / 2 - 40, 10, 20, YELLOW);
         EndTextureMode();
